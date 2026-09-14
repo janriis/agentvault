@@ -1,5 +1,9 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
+import {
+  listDatabaseAgents,
+  replaceDatabaseAgents,
+} from "./vault-database";
 
 export interface StoredAgent {
   id: string;
@@ -74,12 +78,20 @@ const registryPath = path.join(
 let writeQueue = Promise.resolve();
 
 export async function listStoredAgents(): Promise<StoredAgent[]> {
+  const stored = listDatabaseAgents().flatMap((record) => isStoredAgent(record.value) ? [record.value] : []);
+  if (stored.length > 0) return stored;
+
   try {
     const parsed = JSON.parse(await readFile(registryPath, "utf8")) as unknown;
-    return Array.isArray(parsed) ? parsed as StoredAgent[] : DEFAULT_AGENTS;
+    if (Array.isArray(parsed) && parsed.every(isStoredAgent)) {
+      replaceDatabaseAgents(parsed.map((agent) => ({ id: agent.id, value: agent })));
+      return parsed;
+    }
   } catch {
-    return DEFAULT_AGENTS;
+    // Seed the database with the authored defaults below.
   }
+  replaceDatabaseAgents(DEFAULT_AGENTS.map((agent) => ({ id: agent.id, value: agent })));
+  return DEFAULT_AGENTS;
 }
 
 export async function getStoredAgent(agentId: string): Promise<StoredAgent | undefined> {
@@ -90,14 +102,16 @@ export function upsertStoredAgent(agent: StoredAgent): Promise<void> {
   const operation = writeQueue.then(async () => {
     const current = await listStoredAgents();
     const next = [agent, ...current.filter((item) => item.id !== agent.id)];
-    const directory = path.dirname(registryPath);
-    await mkdir(directory, { recursive: true });
-    const temporaryPath = `${registryPath}.tmp`;
-    await writeFile(temporaryPath, JSON.stringify(next, null, 2), "utf8");
-    await rename(temporaryPath, registryPath);
+    replaceDatabaseAgents(next.map((item) => ({ id: item.id, value: item })));
   });
   writeQueue = operation.catch(() => undefined);
   return operation;
+}
+
+function isStoredAgent(value: unknown): value is StoredAgent {
+  if (!value || typeof value !== "object") return false;
+  const agent = value as Partial<StoredAgent>;
+  return typeof agent.id === "string" && typeof agent.name === "string" && typeof agent.role === "string";
 }
 
 export function defaultAgents(): StoredAgent[] {

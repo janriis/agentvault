@@ -1,6 +1,7 @@
 import { mkdir, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { getSelectedWorkspaceDirectory } from "@/agent/lib/workspace-store";
+import { listDatabaseArtifacts, replaceDatabaseArtifacts } from "@/agent/lib/vault-database";
 
 export type StoredArtifactType = "note" | "plan" | "draft" | "file";
 
@@ -24,11 +25,16 @@ export async function listStoredArtifacts(): Promise<StoredArtifact[]> {
         .filter((name) => name.endsWith(".md"))
         .map(async (name) => readArtifactFile(path.join(artifactsDirectory, name))),
     );
-    return artifacts
+    const validArtifacts = artifacts
       .filter((artifact): artifact is StoredArtifact => artifact !== undefined)
       .sort((left, right) => Date.parse(right.updated) - Date.parse(left.updated));
+    if (validArtifacts.length > 0) {
+      replaceDatabaseArtifacts(validArtifacts.map((artifact) => ({ id: artifact.id, value: artifact })));
+      return validArtifacts;
+    }
+    return databaseArtifacts();
   } catch {
-    return [];
+    return databaseArtifacts();
   }
 }
 
@@ -46,6 +52,12 @@ export function upsertStoredArtifact(artifact: StoredArtifact): Promise<void> {
     const temporaryPath = `${targetPath}.tmp`;
     await writeFile(temporaryPath, serializeArtifact(artifact), "utf8");
     await rename(temporaryPath, targetPath);
+    replaceDatabaseArtifacts([
+      { id: artifact.id, value: artifact },
+      ...listDatabaseArtifacts()
+        .filter((record) => record.id !== artifact.id)
+        .map((record) => ({ id: record.id, value: record.value })),
+    ]);
   });
   writeQueue = operation.catch(() => undefined);
   return operation;
@@ -84,6 +96,16 @@ async function readArtifactFile(filePath: string): Promise<StoredArtifact | unde
   } catch {
     return undefined;
   }
+}
+
+function databaseArtifacts(): StoredArtifact[] {
+  return listDatabaseArtifacts().flatMap((record) => isStoredArtifact(record.value) ? [record.value] : []);
+}
+
+function isStoredArtifact(value: unknown): value is StoredArtifact {
+  if (!value || typeof value !== "object") return false;
+  const artifact = value as Partial<StoredArtifact>;
+  return isSafeId(artifact.id) && typeof artifact.title === "string" && isArtifactType(artifact.type) && typeof artifact.owner === "string" && typeof artifact.updated === "string" && typeof artifact.content === "string";
 }
 
 function serializeArtifact(artifact: StoredArtifact): string {

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { saveAgentSession, type StoredAgentSession } from "@/agent/lib/agent-sessions";
+import { maybeCreateScheduledBackup } from "@/agent/lib/vault-export";
 
 export async function POST(request: Request) {
   const payload = await request.json().catch(() => null) as Partial<StoredAgentSession> | null;
@@ -14,6 +15,7 @@ export async function POST(request: Request) {
     updatedAt: new Date().toISOString(),
   };
   await saveAgentSession(session);
+  await maybeCreateScheduledBackup().catch(() => undefined);
   return NextResponse.json({ session }, { status: 201 });
 }
 

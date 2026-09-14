@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { listStoredAgents, upsertStoredAgent, type StoredAgent } from "@/agent/lib/agent-registry";
+import { maybeCreateScheduledBackup } from "@/agent/lib/vault-export";
 
 export async function GET() {
   return NextResponse.json({ agents: await listStoredAgents() });
@@ -24,6 +25,7 @@ export async function POST(request: Request) {
   };
 
   await upsertStoredAgent(agent);
+  await maybeCreateScheduledBackup().catch(() => undefined);
   return NextResponse.json({ agent }, { status: 201 });
 }
 

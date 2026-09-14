@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { listStoredArtifacts, upsertStoredArtifact, type StoredArtifact, type StoredArtifactType } from "@/agent/lib/artifact-store";
+import { maybeCreateScheduledBackup } from "@/agent/lib/vault-export";
 
 export async function GET() {
   return NextResponse.json({ artifacts: await listStoredArtifacts() });
@@ -28,6 +29,7 @@ async function saveArtifact(request: Request, status: 200 | 201) {
     content: payload.content.slice(0, 1_000_000),
   };
   await upsertStoredArtifact(artifact);
+  await maybeCreateScheduledBackup().catch(() => undefined);
   return NextResponse.json({ artifact }, { status });
 }
 

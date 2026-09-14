@@ -1,5 +1,6 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { listDatabaseSessions, replaceDatabaseSessions } from "./vault-database";
 
 export interface StoredAgentSession {
   agentId: string;
@@ -16,12 +17,19 @@ const sessionsPath = path.join(
 let writeQueue = Promise.resolve();
 
 async function listSessions(): Promise<StoredAgentSession[]> {
+  const stored = listDatabaseSessions().flatMap((record) => isStoredSession(record.value) ? [record.value] : []);
+  if (stored.length > 0) return stored;
+
   try {
     const parsed = JSON.parse(await readFile(sessionsPath, "utf8")) as unknown;
-    return Array.isArray(parsed) ? parsed as StoredAgentSession[] : [];
+    if (Array.isArray(parsed) && parsed.every(isStoredSession)) {
+      replaceDatabaseSessions(parsed.map((session) => ({ id: sessionKey(session), value: session })));
+      return parsed;
+    }
   } catch {
-    return [];
+    // No legacy sessions means the database starts empty.
   }
+  return [];
 }
 
 export async function findAgentSession(agentId: string, roomId?: string): Promise<StoredAgentSession | undefined> {
@@ -33,12 +41,22 @@ export function saveAgentSession(session: StoredAgentSession): Promise<void> {
   const operation = writeQueue.then(async () => {
     const current = await listSessions();
     const next = [session, ...current.filter((item) => !(item.agentId === session.agentId && item.roomId === session.roomId))];
-    const directory = path.dirname(sessionsPath);
-    await mkdir(directory, { recursive: true });
-    const temporaryPath = `${sessionsPath}.tmp`;
-    await writeFile(temporaryPath, JSON.stringify(next, null, 2), "utf8");
-    await rename(temporaryPath, sessionsPath);
+    replaceDatabaseSessions(next.map((item) => ({ id: sessionKey(item), value: item })));
   });
   writeQueue = operation.catch(() => undefined);
   return operation;
+}
+
+export async function listStoredAgentSessions(): Promise<StoredAgentSession[]> {
+  return listSessions();
+}
+
+function sessionKey(session: StoredAgentSession): string {
+  return `${session.agentId}:${session.roomId ?? ""}`;
+}
+
+function isStoredSession(value: unknown): value is StoredAgentSession {
+  if (!value || typeof value !== "object") return false;
+  const session = value as Partial<StoredAgentSession>;
+  return typeof session.agentId === "string" && typeof session.eveSessionId === "string" && typeof session.updatedAt === "string";
 }

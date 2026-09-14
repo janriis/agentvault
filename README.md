@@ -120,22 +120,37 @@ the source message is recorded so repeated extraction does not duplicate them.
 The room transcript opens in a bounded, scrollable viewer and can still be
 copied or downloaded as Markdown.
 
-Room membership and transcript state are currently stored in the browser's
-local workspace. Shared artifacts are persisted as Markdown files in the
-selected local workspace folder. Click **My workspace** in the left sidebar to
-browse the project root and choose a folder; the selection is saved in
-`.data/workspace.json` (or the configured `AGENT_VAULT_DATA_DIR`) and is used by
-the artifact API and agent artifact tools. The default remains
-`.data/artifacts/`, so existing vault files continue to work. The selected
-folder must exist inside the project root, which keeps local agent writes
-contained. EVE agents still run in isolated sandboxes; bridging arbitrary
-workspace files into those sandboxes requires an explicit file tool.
+Core workspace state—agents, people, rooms, tasks, and activity—is persisted in
+the SQLite database `.data/agent-vault.db` (or the configured
+`AGENT_VAULT_DATA_DIR`). The database uses additive migrations, revisioned
+writes, and transactional updates. On first startup, an empty database imports
+the existing browser workspace once; browser storage is retained only as a
+temporary migration fallback.
+
+Shared artifacts are persisted as Markdown files in the selected local
+workspace folder. Click **My workspace** in the left sidebar to browse the
+project root and choose a folder; the selection is saved in `.data/workspace.json`
+(or the configured `AGENT_VAULT_DATA_DIR`) and is used by the artifact API and
+agent artifact tools. The default remains `.data/artifacts/`, so existing vault
+files continue to work. The selected folder must exist inside the project root,
+which keeps local agent writes contained. EVE agents still run in isolated
+sandboxes; bridging arbitrary workspace files into those sandboxes requires an
+explicit file tool.
 
 The web UI reads and writes artifacts through `/api/artifacts`; agents with the
 `Artifacts` capability can list or read them, and agents with `Edit artifacts`
 can create or update them with EVE approval. A multi-user deployment should
 move room data, artifact metadata, and message events to a shared database
 before adding realtime presence or cross-device collaboration.
+
+Agent profiles and EVE session mappings are migrated into SQLite, with legacy
+`.data/agents.json` and `.data/agent-sessions.json` imported only when their new
+tables are empty. Use the workspace selector's **Export vault** action for a
+portable JSON snapshot, or call `POST /api/vault/backup` to create a timestamped
+recovery copy under `.data/backups/`. Normal vault activity also creates a
+backup automatically every six hours by default; configure the interval with
+`AGENT_VAULT_BACKUP_INTERVAL_MS`. Restore a versioned export through
+`POST /api/vault/import` with an explicit `confirm: true` safety gate.
 
 Set `AGENT_VAULT_DATA_DIR` if the durable registry should live outside the
 project directory. The directory must be writable by the server process.
