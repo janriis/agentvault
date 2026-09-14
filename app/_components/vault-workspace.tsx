@@ -174,6 +174,21 @@ interface ActivityItem {
   agent?: string;
 }
 
+interface VaultStatePayload {
+  agents: Agent[];
+  people: Person[];
+  rooms: Room[];
+  tasks: Task[];
+  activity: ActivityItem[];
+}
+
+interface VaultStateResponse {
+  record?: {
+    state?: unknown;
+    revision?: number;
+  };
+}
+
 const STORAGE_KEY = "agent-vault-workspace-v1";
 const EMPTY_PERSON_IDS: string[] = [];
 
@@ -415,8 +430,10 @@ export function VaultWorkspace() {
   const [showTaskCreator, setShowTaskCreator] = useState(false);
   const [showWorkspaceSettings, setShowWorkspaceSettings] = useState(false);
   const [workspace, setWorkspace] = useState<WorkspaceConfig>();
+  const [backendReady, setBackendReady] = useState(false);
   const [taskRoomId, setTaskRoomId] = useState<string>();
   const artifactSaveTimers = useRef<Record<string, number>>({});
+  const backendRevision = useRef(0);
   const [safetyRequest, setSafetyRequest] = useState<{
     title: string;
     detail: string;
@@ -437,30 +454,69 @@ export function VaultWorkspace() {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+    let legacyState: VaultStatePayload | undefined;
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
-      if (!saved) return;
-      const parsed = JSON.parse(saved) as Partial<{
-        agents: Agent[];
-        people: Person[];
-        rooms: Room[];
-        tasks: Task[];
-        artifacts: Artifact[];
-        activity: ActivityItem[];
-      }>;
-      if (Array.isArray(parsed.agents)) setAgents(parsed.agents);
-      if (Array.isArray(parsed.people)) setPeople(parsed.people);
-      if (Array.isArray(parsed.rooms)) setRooms(parsed.rooms);
-      if (Array.isArray(parsed.tasks)) {
-        setTasks(
-          (parsed.tasks as unknown as Array<Partial<Task> & { agentId?: string }>).map(normalizeStoredTask),
-        );
+      if (saved) {
+        const parsed = JSON.parse(saved) as Partial<VaultStatePayload & { tasks: Array<Partial<Task> & { agentId?: string }> }>;
+        legacyState = {
+          agents: Array.isArray(parsed.agents) ? parsed.agents : initialAgents,
+          people: Array.isArray(parsed.people) ? parsed.people : initialPeople,
+          rooms: Array.isArray(parsed.rooms) ? parsed.rooms : initialRooms,
+          tasks: Array.isArray(parsed.tasks) ? parsed.tasks.map(normalizeStoredTask) : initialTasks,
+          activity: Array.isArray(parsed.activity) ? parsed.activity : initialActivity,
+        };
       }
-      if (Array.isArray(parsed.artifacts)) setArtifacts(parsed.artifacts);
-      if (Array.isArray(parsed.activity)) setActivity(parsed.activity);
     } catch {
-      // Local workspace persistence is optional.
+      // The backend remains the source of truth if legacy browser data is invalid.
     }
+
+    const applyState = (state: VaultStatePayload) => {
+      setAgents(state.agents);
+      setPeople(state.people);
+      setRooms(state.rooms);
+      setTasks(state.tasks);
+      setActivity(state.activity);
+    };
+
+    void fetch("/api/vault-state", { cache: "no-store" })
+      .then(async (response) => response.ok ? await response.json() as { record?: { state?: unknown; revision?: number } | null } : null)
+      .then(async (payload) => {
+        if (cancelled) return;
+        if (payload?.record?.state && isVaultStatePayload(payload.record.state)) {
+          applyState(payload.record.state);
+          backendRevision.current = payload.record.revision ?? 0;
+          setBackendReady(true);
+          return;
+        }
+
+        const state = legacyState ?? {
+          agents: initialAgents,
+          people: initialPeople,
+          rooms: initialRooms,
+          tasks: initialTasks,
+          activity: initialActivity,
+        };
+        applyState(state);
+        const saveResponse = await fetch("/api/vault-state", {
+          body: JSON.stringify({ state }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        });
+        if (saveResponse.ok) {
+          const saved = await saveResponse.json() as { record?: { revision?: number } };
+          backendRevision.current = saved.record?.revision ?? 0;
+        }
+        setBackendReady(true);
+      })
+      .catch(() => {
+        if (!cancelled) setBackendReady(true);
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -520,12 +576,46 @@ export function VaultWorkspace() {
   }, []);
 
   useEffect(() => {
+    if (!backendReady) return;
+    const timer = window.setTimeout(() => {
+      void fetch("/api/vault-state", {
+        body: JSON.stringify({
+          expectedRevision: backendRevision.current,
+          state: { agents, people, rooms, tasks, activity },
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      })
+        .then(async (response) => {
+          if (response.ok) return await response.json() as VaultStateResponse;
+          if (response.status !== 409) return null;
+          const latestResponse = await fetch("/api/vault-state", { cache: "no-store" });
+          return latestResponse.ok ? await latestResponse.json() as VaultStateResponse : null;
+        })
+        .then((payload) => {
+          const record = payload?.record;
+          if (record?.revision !== undefined) backendRevision.current = record.revision;
+          if (record?.state && isVaultStatePayload(record.state)) {
+            setAgents(record.state.agents);
+            setPeople(record.state.people);
+            setRooms(record.state.rooms);
+            setTasks(record.state.tasks);
+            setActivity(record.state.activity);
+          }
+        })
+        .catch(() => undefined);
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [activity, agents, backendReady, people, rooms, tasks]);
+
+  useEffect(() => {
     try {
+      if (!backendReady) return;
       localStorage.setItem(STORAGE_KEY, JSON.stringify({ agents, people, rooms, tasks, artifacts, activity }));
     } catch {
       // Local workspace persistence is optional.
     }
-  }, [agents, people, rooms, tasks, artifacts, activity]);
+  }, [activity, agents, artifacts, backendReady, people, rooms, tasks]);
 
   const selectedRoom = rooms.find((room) => room.id === selectedRoomId) ?? rooms[0];
   const selectedArtifact =
@@ -1797,6 +1887,7 @@ function WorkspaceDialog({ open, onClose, onSelected }: { readonly open: boolean
   };
 
   const parentPath = currentPath === "." ? undefined : currentPath.split(/[\\/]/u).slice(0, -1).join("/") || ".";
+
   const selectFolder = () => {
     setSelecting(true);
     setError(undefined);
@@ -1815,7 +1906,7 @@ function WorkspaceDialog({ open, onClose, onSelected }: { readonly open: boolean
       .finally(() => setSelecting(false));
   };
 
-  return <Dialog open={open} onOpenChange={(nextOpen) => !nextOpen && onClose()}><DialogContent className="flex max-h-[min(80vh,700px)] flex-col sm:max-w-xl"><DialogHeader><DialogTitle className="flex items-center gap-2"><FolderOpenIcon className="size-5 text-muted-foreground" /> Choose local workspace folder</DialogTitle><DialogDescription>Agent Vault stores shared artifacts in the folder you select. Browse folders inside this project and choose the location that should hold the vault files.</DialogDescription></DialogHeader><div className="min-h-0 space-y-4 overflow-y-auto"><div className="rounded-lg border bg-muted/20 p-3"><p className="text-xs font-medium">Project root</p><p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">{rootPath || "Loading…"}</p></div><div className="flex items-center justify-between gap-3"><div className="min-w-0"><p className="text-xs font-medium">Browsing</p><p className="truncate font-mono text-xs text-muted-foreground">{currentPath === "." ? "Project root" : currentPath}</p></div><div className="flex shrink-0 gap-2">{parentPath ? <Button onClick={() => browse(parentPath)} size="sm" variant="outline">Up</Button> : null}<Button disabled={currentPath === "."} onClick={() => browse(".")} size="sm" variant="ghost">Project root</Button></div></div>{error ? <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">{error}</div> : null}<div className="min-h-40 rounded-lg border">{loading ? <p className="p-4 text-sm text-muted-foreground">Loading folders…</p> : entries.length > 0 ? <div className="divide-y">{entries.map((entry) => <button className="flex w-full items-center gap-3 px-3 py-2.5 text-left text-sm hover:bg-accent" key={entry.relativePath} onClick={() => browse(entry.relativePath)} type="button"><FolderOpenIcon className="size-4 text-muted-foreground" /><span className="truncate">{entry.name}</span><ChevronRightIcon className="ml-auto size-4 text-muted-foreground" /></button>)}</div> : <p className="p-4 text-sm text-muted-foreground">No subfolders here. This folder can still be used for artifacts.</p>}</div><p className="text-xs leading-5 text-muted-foreground">Selected folder: <span className="font-medium text-foreground">{currentPath === "." ? "Project root" : currentPath}</span>. Agent sandbox files remain isolated by EVE; this setting controls Agent Vault’s local artifact storage.</p></div><DialogFooter><Button onClick={onClose} variant="outline">Cancel</Button><Button disabled={loading || selecting} onClick={selectFolder}><FolderOpenIcon />{selecting ? "Selecting…" : "Use this folder"}</Button></DialogFooter></DialogContent></Dialog>;
+  return <Dialog open={open} onOpenChange={(nextOpen) => !nextOpen && onClose()}><DialogContent className="flex max-h-[min(80vh,700px)] flex-col sm:max-w-xl"><DialogHeader><DialogTitle className="flex items-center gap-2"><FolderOpenIcon className="size-5 text-muted-foreground" /> Choose local workspace folder</DialogTitle><DialogDescription>Agent Vault stores shared artifacts in the folder you select. Browse folders inside this project and choose the location that should hold the vault files.</DialogDescription></DialogHeader><div className="min-h-0 space-y-4 overflow-y-auto"><div className="rounded-lg border bg-muted/20 p-3"><p className="text-xs font-medium">Project root</p><p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">{rootPath || "Loading…"}</p></div><div className="flex items-center justify-between gap-3"><div className="min-w-0"><p className="text-xs font-medium">Browsing</p><p className="truncate font-mono text-xs text-muted-foreground">{currentPath === "." ? "Project root" : currentPath}</p></div><div className="flex shrink-0 gap-2">{parentPath ? <Button onClick={() => browse(parentPath)} size="sm" variant="outline">Up</Button> : null}<Button disabled={currentPath === "."} onClick={() => browse(".")} size="sm" variant="ghost">Project root</Button></div></div>{error ? <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">{error}</div> : null}<div className="min-h-40 rounded-lg border">{loading ? <p className="p-4 text-sm text-muted-foreground">Loading folders…</p> : entries.length > 0 ? <div className="divide-y">{entries.map((entry) => <button className="flex w-full items-center gap-3 px-3 py-2.5 text-left text-sm hover:bg-accent" key={entry.relativePath} onClick={() => browse(entry.relativePath)} type="button"><FolderOpenIcon className="size-4 text-muted-foreground" /><span className="truncate">{entry.name}</span><ChevronRightIcon className="ml-auto size-4 text-muted-foreground" /></button>)}</div> : <p className="p-4 text-sm text-muted-foreground">No subfolders here. This folder can still be used for artifacts.</p>}</div><p className="text-xs leading-5 text-muted-foreground">Selected folder: <span className="font-medium text-foreground">{currentPath === "." ? "Project root" : currentPath}</span>. Agent sandbox files remain isolated by EVE; this setting controls Agent Vault’s local artifact storage.</p></div><DialogFooter><a className="mr-auto inline-flex items-center gap-2 rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-accent hover:text-foreground" download href="/api/vault/export"><FileDownIcon className="size-4" /> Export vault</a><Button onClick={onClose} variant="outline">Cancel</Button><Button disabled={loading || selecting} onClick={selectFolder}><FolderOpenIcon />{selecting ? "Selecting…" : "Use this folder"}</Button></DialogFooter></DialogContent></Dialog>;
 }
 
 function SpawnerDialog({ open, onClose, onCreate, localModels, modelsLoading }: { readonly open: boolean; readonly onClose: () => void; readonly onCreate: (agent: Agent) => void; readonly localModels: DiscoveredModel[]; readonly modelsLoading: boolean }) {
@@ -1973,6 +2064,11 @@ function normalizeStoredTask(task: Partial<Task> & { agentId?: string }): Task {
     priority: task.priority ?? "medium",
     updated: task.updated ?? "Just now",
   };
+}
+function isVaultStatePayload(value: unknown): value is VaultStatePayload {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<VaultStatePayload>;
+  return [candidate.agents, candidate.people, candidate.rooms, candidate.tasks, candidate.activity].every(Array.isArray);
 }
 function taskAssigneeName(task: Task, agents: Agent[], people: Person[]): string {
   return task.assigneeType === "person"
