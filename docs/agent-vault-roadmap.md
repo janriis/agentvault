@@ -129,6 +129,8 @@ Implementation record:
 8. Verification: `npm run typecheck` and `git diff --check` passed.
 9. Added durable cancellation plus board controls for cancelling active runs
    and retrying blocked work with a fresh task revision.
+10. Removed SSR-unsafe relative timestamp rendering from artifact cards; the
+    label is now deterministic across server render and hydration.
 
 ### Phase 3 — Real workspace and file operations
 

@@ -2206,13 +2206,9 @@ function memberCount(room: Room) { return room.agentIds.length + (room.personIds
 function artifactUpdatedLabel(value: string) {
   const timestamp = Date.parse(value);
   if (Number.isNaN(timestamp)) return value;
-  const minutes = Math.max(0, Math.floor((Date.now() - timestamp) / 60_000));
-  if (minutes < 1) return "Just now";
-  if (minutes < 60) return `${minutes} min ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours} hr ago`;
-  const days = Math.floor(hours / 24);
-  return `${days} day${days === 1 ? "" : "s"} ago`;
+  // Keep this label deterministic during SSR and hydration. Relative time
+  // based on Date.now() would produce different server/client markup.
+  return new Date(timestamp).toISOString().slice(0, 10);
 }
 function roleLabel(role: Role) { return role === "custom" ? "Custom role" : role.charAt(0).toUpperCase() + role.slice(1); }
 function statusLabel(status: AgentStatus) { return status === "working" ? "Working" : status === "paused" ? "Paused" : status === "blocked" ? "Blocked" : "Ready"; }
