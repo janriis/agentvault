@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { unmetTaskDependencies, validateTaskDependencies } from "./task-dependencies.ts";
+import { projectTaskRuns, type ProjectableTask } from "./task-projection.ts";
 
 export interface PersistedVaultState {
   agents: unknown[];
@@ -79,7 +80,7 @@ export function getVaultState(): VaultStateRecord | undefined {
   const row = getDatabase().prepare("SELECT state_json, revision, updated_at FROM vault_state WHERE id = ?").get("default") as { state_json?: string; revision?: number; updated_at?: string } | undefined;
   if (!row?.state_json) return undefined;
   return {
-    state: JSON.parse(row.state_json) as PersistedVaultState,
+    state: projectVaultState(JSON.parse(row.state_json) as PersistedVaultState),
     revision: row.revision ?? 0,
     updatedAt: row.updated_at ?? new Date(0).toISOString(),
   };
@@ -98,6 +99,7 @@ export function saveVaultState(state: PersistedVaultState, expectedRevision?: nu
     }
     const revision = currentRevision + 1;
     const updatedAt = new Date().toISOString();
+    const projectedState = projectVaultState(state);
     db.prepare(`
       INSERT INTO vault_state (id, state_json, revision, updated_at)
       VALUES (?, ?, ?, ?)
@@ -105,13 +107,17 @@ export function saveVaultState(state: PersistedVaultState, expectedRevision?: nu
         state_json = excluded.state_json,
         revision = excluded.revision,
         updated_at = excluded.updated_at
-    `).run("default", JSON.stringify(state), revision, updatedAt);
+    `).run("default", JSON.stringify(projectedState), revision, updatedAt);
     db.exec("COMMIT");
-    return { state, revision, updatedAt };
+    return { state: projectedState, revision, updatedAt };
   } catch (error) {
     db.exec("ROLLBACK");
     throw error;
   }
+}
+
+function projectVaultState(state: PersistedVaultState): PersistedVaultState {
+  return { ...state, tasks: projectTaskRuns(state.tasks as ProjectableTask[], listTaskRuns()) };
 }
 
 export function listDatabaseAgents(): DatabaseJsonRecord[] {
@@ -276,6 +282,45 @@ export function finishTaskRun(taskId: string, taskRevision: number, attempt: num
 
 export function listTaskRuns(): TaskRunRecord[] {
   return getDatabase().prepare("SELECT task_id, task_revision, agent_id, status, attempt, result, error, eve_session_id, started_at, finished_at, updated_at FROM task_runs ORDER BY updated_at DESC").all().flatMap((row) => parseTaskRunRow(row as Record<string, unknown>) ?? []);
+}
+
+export function replaceTaskRuns(runs: TaskRunRecord[]): void {
+  const db = getDatabase();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.exec("DELETE FROM task_runs");
+    insertTaskRuns(db, runs);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+export function restoreVaultStateWithRuns(state: PersistedVaultState, runs: TaskRunRecord[]): VaultStateRecord {
+  const taskError = validateTaskDependencies(state.tasks as Array<{ id: string; status: string; dependsOn?: string[] }>);
+  if (taskError) throw new VaultStateValidationError(taskError);
+  const db = getDatabase();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const current = db.prepare("SELECT revision FROM vault_state WHERE id = ?").get("default") as { revision?: number } | undefined;
+    const revision = (current?.revision ?? 0) + 1;
+    db.exec("DELETE FROM task_runs");
+    insertTaskRuns(db, runs);
+    const projectedState = projectVaultState(state);
+    const updatedAt = new Date().toISOString();
+    db.prepare("INSERT INTO vault_state (id, state_json, revision, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET state_json = excluded.state_json, revision = excluded.revision, updated_at = excluded.updated_at").run("default", JSON.stringify(projectedState), revision, updatedAt);
+    db.exec("COMMIT");
+    return { state: projectedState, revision, updatedAt };
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function insertTaskRuns(db: DatabaseSync, runs: TaskRunRecord[]): void {
+  const insert = db.prepare("INSERT INTO task_runs (task_id, task_revision, agent_id, status, attempt, result, error, eve_session_id, started_at, finished_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+  for (const run of runs) insert.run(run.taskId, run.taskRevision, run.agentId, run.status, run.attempt, run.result ?? null, run.error ?? null, run.eveSessionId ?? null, run.startedAt, run.finishedAt ?? null, run.updatedAt);
 }
 
 export function getVaultSettings(): VaultSettings {

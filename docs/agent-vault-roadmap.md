@@ -105,7 +105,8 @@ Status: **In progress — task-run ledger and board projection slices implemente
 - [x] Add explicit cancel and retry controls for agent-owned tasks.
 - [x] Add prerequisite graphs and prevent claims until they are complete.
 - [x] Fence task results to the active attempt and saved task revision.
-- [ ] Define durable task state transitions and acceptance criteria.
+- [ ] Define and enforce durable task state transitions across all board controls.
+- [x] Record explicit acceptance criteria when tasks are created or edited.
 - [ ] Add task dependencies, idempotency keys, retries, and cancellation.
 - [x] Add a local persistent worker/runner for queued agent tasks.
 - [ ] Detect stalled runs and resume interrupted sessions.
@@ -159,6 +160,33 @@ Implementation record:
     production build succeeded after the sandbox permitted Next's local CSS
     processor. The worker started against an isolated empty database, and the
     live Task Board remained readable after the browser runner was removed.
+19. Added a pure run-to-board projection. SQLite reads and saves now overlay
+    matching agent-run status and result, so a stale browser write cannot
+    replace a completed result. Five-second UI polling uses the same function
+    without creating a new state object when nothing changed.
+20. New Task Board tasks require explicit acceptance criteria; editing and
+    room-extracted cards carry them forward. The worker includes those criteria
+    in the EVE task prompt. Legacy cards without criteria remain readable.
+21. Verification: eleven focused unit/SQLite checks passed, including stale
+    browser overwrite protection and task-prompt criteria. TypeScript passed,
+    and the live Assign Task form showed the criteria field and kept Assign
+    disabled until the required fields were supplied.
+22. Updated portable exports to version 2 with task-run ledger records.
+    Restoring version 2 reinstates runs before projecting vault task state;
+    restoring a legacy version 1 export clears current runs rather than
+    accidentally attaching them to imported task cards.
+23. Verification: twelve focused unit/SQLite checks and a production build
+    passed. An isolated production server on port 3999 accepted a synthetic
+    completed task, exported version 2 with its run, cleared runs on version 1
+    import, and restored the run plus completed Task Board status on version 2
+    import. The temporary server was stopped after the check.
+24. Made vault-state and task-run replacement one SQLite transaction during
+    import. Invalid task graphs and duplicate run records fail before either
+    durable record is changed.
+25. Verification: thirteen focused unit/SQLite checks, TypeScript, and a fresh
+    production build passed. The isolated version 1 and version 2 API restore
+    flow passed again with the transactional implementation, and the temporary
+    server was stopped.
 
 ### Phase 3 — Real workspace and file operations
 

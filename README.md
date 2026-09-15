@@ -132,6 +132,10 @@ board so a refresh does not hide work already claimed by an agent.
 Open a task to choose other tasks it must wait for. The board shows when a task
 has unfinished prerequisites, and the backend refuses to claim it until those
 tasks are completed. Circular or missing prerequisites are rejected.
+New tasks also ask for explicit acceptance criteria. Those criteria stay with
+the card when it is edited and are included in the assigned agent's work
+prompt. Agent task status and results are projected from the durable run ledger,
+so an out-of-date browser save cannot erase a completed result.
 
 In a room, use **Task** to create a board item with the room attached. If an
 agent has already written task cards in the conversation, use **Extract tasks**
@@ -171,6 +175,9 @@ recovery copy under `.data/backups/`. Normal vault activity also creates a
 backup automatically every six hours by default; configure the interval with
 `AGENT_VAULT_BACKUP_INTERVAL_MS`. Restore a versioned export through
 `POST /api/vault/import` with an explicit `confirm: true` safety gate.
+Version 2 exports include the task-run ledger. Older version 1 exports remain
+importable; their restore clears unrelated current task runs before loading
+the imported task state.
 
 Set `AGENT_VAULT_DATA_DIR` if the durable registry should live outside the
 project directory. The directory must be writable by the server process.

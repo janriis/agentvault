@@ -5,6 +5,7 @@ export interface RunnableTask {
   id: string;
   title: string;
   description: string;
+  acceptanceCriteria?: string;
   revision: number;
   assigneeId: string;
   assigneeType: "agent" | "person";
@@ -72,6 +73,7 @@ export function buildWorkerTaskPrompt({ task, agent, room }: WorkerJob): string 
     agent.context ?? agent.description,
     `Assigned task: ${task.title}`,
     `Instructions:\n${task.description}`,
+    task.acceptanceCriteria ? `Acceptance criteria — explain how each is met with concrete evidence:\n${task.acceptanceCriteria}` : "Report the result and any unresolved concerns.",
     room ? `This task came from the workshop room “${room.name}”. Room purpose: ${room.description}` : "This task was assigned from the Agent Vault task board.",
     "Start working on the task now. Return a concise progress update or completed result with concrete findings, decisions, files, or next steps. Do not only describe how you would approach it.",
   ].join("\n\n");

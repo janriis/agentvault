@@ -6,7 +6,7 @@ import test from "node:test";
 
 const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "agent-vault-task-test-"));
 process.env.AGENT_VAULT_DATA_DIR = dataDirectory;
-const { TaskClaimError, attachTaskRunSession, cancelTaskRun, claimTaskRun, finishTaskRun, getVaultSettings, heartbeatTaskRun, listTaskRuns, saveVaultState } = await import("../agent/lib/vault-database.ts");
+const { TaskClaimError, attachTaskRunSession, cancelTaskRun, claimTaskRun, finishTaskRun, getVaultSettings, getVaultState, heartbeatTaskRun, listTaskRuns, replaceTaskRuns, restoreVaultStateWithRuns, saveVaultState } = await import("../agent/lib/vault-database.ts");
 const { findRunnableJobs, runWorkerJob } = await import("../agent/lib/task-orchestration.ts");
 
 const state = (tasks) => ({ agents: [], people: [], rooms: [], tasks, activity: [] });
@@ -58,5 +58,34 @@ test("EVE session identity and heartbeat are attempt-fenced", () => {
   assert.equal(heartbeatTaskRun("session-task", 0, run.attempt), false);
   assert.equal(attachTaskRunSession("session-task", 0, run.attempt, "wrun_late-session"), undefined);
 });
+
+test("a stale browser save cannot replace a completed agent run", () => {
+  saveVaultState(state([task("projection-task")]));
+  const run = claimTaskRun("projection-task", 0, "researcher");
+  finishTaskRun("projection-task", 0, run.attempt, { status: "completed", result: "Verified result" });
+  const staleSave = saveVaultState(state([task("projection-task", "queued")]));
+  assert.equal(staleSave.state.tasks[0].status, "completed");
+  assert.equal(getVaultState().state.tasks[0].result, "Verified result");
+});
+
+test("task-run ledger can be restored before vault-state projection", () => {
+  const snapshot = listTaskRuns();
+  assert.ok(snapshot.length > 0);
+  replaceTaskRuns([]);
+  assert.equal(listTaskRuns().length, 0);
+  replaceTaskRuns(snapshot);
+  assert.deepEqual(listTaskRuns(), snapshot);
+  assert.equal(getVaultState().state.tasks[0].status, "completed");
+});
+
+test("invalid restore leaves both vault state and run ledger unchanged", () => {
+  const before = getVaultState();
+  const runs = listTaskRuns();
+  assert.throws(() => restoreVaultStateWithRuns(state([task("bad", "queued", ["missing"])]), []), /does not exist/);
+  assert.throws(() => restoreVaultStateWithRuns(state([task("projection-task")]), [runs[0], runs[0]]), /UNIQUE/);
+  assert.equal(getVaultState().revision, before.revision);
+  assert.deepEqual(listTaskRuns(), runs);
+});
+
 
 test.after(() => rmSync(dataDirectory, { recursive: true, force: true }));
