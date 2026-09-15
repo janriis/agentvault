@@ -1625,17 +1625,22 @@ function RoomAgentRunner({ agent, mentionTargets, onFailure, onMessage, onStatus
 
 function TaskAgentRunner({ agent, task, room, onStart, onComplete, onFailure }: { readonly agent: Agent; readonly task: Task; readonly room?: Room; readonly onStart: (taskId: string, revision: number) => void; readonly onComplete: (taskId: string, revision: number, result: string) => void; readonly onFailure: (taskId: string, revision: number, detail: string) => void }) {
   const sentRevision = useRef<number | undefined>(undefined);
+  const reportedRevision = useRef<number | undefined>(undefined);
   const revision = task.revision ?? 0;
   const route = roomAgentRoute(agent.id);
   const eveAgent = useEveAgent({
     agent: route,
     ...(route === "custom" ? { headers: { "x-vault-agent-id": agent.id } } : {}),
     onError(error) {
-      onFailure(task.id, revision, error.message);
+      if (reportedRevision.current === revision) return;
+      reportedRevision.current = revision;
+      void persistTaskRun(task.id, revision, "fail", error.message).catch(() => undefined).finally(() => onFailure(task.id, revision, error.message));
     },
     onFinish(snapshot) {
       const result = latestAssistantText(snapshot.data.messages);
-      if (result.length > 0) onComplete(task.id, revision, result);
+      if (result.length === 0 || reportedRevision.current === revision) return;
+      reportedRevision.current = revision;
+      void persistTaskRun(task.id, revision, "complete", result).catch(() => undefined).finally(() => onComplete(task.id, revision, result));
     },
     onSessionChange(session) {
       if (!session) return;
@@ -1650,19 +1655,40 @@ function TaskAgentRunner({ agent, task, room, onStart, onComplete, onFailure }: 
   useEffect(() => {
     if (sentRevision.current === revision || eveAgent.status === "resuming") return;
     sentRevision.current = revision;
-    onStart(task.id, revision);
-    void eveAgent.send(buildTaskPrompt(task, agent, room), {
-      clientContext: JSON.stringify({
-        vaultAgentId: agent.id,
-        vaultAgent: agent,
-        vaultModel: getRoomModelContext(agent),
-      }),
-    }).catch((error: unknown) => {
-      onFailure(task.id, revision, error instanceof Error ? error.message : "The agent could not complete its task.");
+    void (async () => {
+      const claimResponse = await fetch("/api/tasks", {
+        body: JSON.stringify({ action: "claim", taskId: task.id, taskRevision: revision, agentId: agent.id }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      if (!claimResponse.ok) throw new Error("The task could not be claimed by the agent.");
+      const claim = await claimResponse.json() as { run?: { status?: string } };
+      if (claim.run?.status === "completed") return;
+      onStart(task.id, revision);
+      await eveAgent.send(buildTaskPrompt(task, agent, room), {
+        clientContext: JSON.stringify({
+          vaultAgentId: agent.id,
+          vaultAgent: agent,
+          vaultModel: getRoomModelContext(agent),
+        }),
+      });
+    })().catch((error: unknown) => {
+      const detail = error instanceof Error ? error.message : "The agent could not complete its task.";
+      if (reportedRevision.current === revision) return;
+      reportedRevision.current = revision;
+      void persistTaskRun(task.id, revision, "fail", detail).catch(() => undefined).finally(() => onFailure(task.id, revision, detail));
     });
   }, [agent, eveAgent, onFailure, onStart, room, revision, task]);
 
   return null;
+}
+
+function persistTaskRun(taskId: string, taskRevision: number, action: "complete" | "fail", value: string): Promise<void> {
+  return fetch("/api/tasks", {
+    body: JSON.stringify({ action, taskId, taskRevision, ...(action === "complete" ? { result: value } : { error: value }) }),
+    headers: { "Content-Type": "application/json" },
+    method: "POST",
+  }).then(() => undefined);
 }
 
 function buildMentionTargets(agents: Agent[], people: Person[]): MentionTarget[] {

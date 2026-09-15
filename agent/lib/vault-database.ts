@@ -22,6 +22,19 @@ export interface DatabaseJsonRecord {
   updatedAt: string;
 }
 
+export interface TaskRunRecord {
+  taskId: string;
+  taskRevision: number;
+  agentId: string;
+  status: "active" | "completed" | "failed" | "blocked";
+  attempt: number;
+  result?: string;
+  error?: string;
+  startedAt: string;
+  finishedAt?: string;
+  updatedAt: string;
+}
+
 export class VaultStateConflictError extends Error {
   constructor(public readonly currentRevision: number) {
     super("The vault changed in another session. Reload before saving again.");
@@ -132,6 +145,71 @@ export function replaceDatabaseArtifacts(records: Array<{ id: string; value: unk
   }
 }
 
+export function claimTaskRun(taskId: string, taskRevision: number, agentId: string): TaskRunRecord {
+  const db = getDatabase();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const current = readTaskRun(db, taskId);
+    if (current && current.taskRevision === taskRevision && (current.status === "active" || current.status === "completed")) {
+      db.exec("COMMIT");
+      return current;
+    }
+    const now = new Date().toISOString();
+    const record: TaskRunRecord = {
+      taskId,
+      taskRevision,
+      agentId,
+      status: "active",
+      attempt: current?.taskRevision === taskRevision ? current.attempt + 1 : 1,
+      startedAt: now,
+      updatedAt: now,
+    };
+    db.prepare(`
+      INSERT INTO task_runs (task_id, task_revision, agent_id, status, attempt, result, error, started_at, finished_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, NULL, ?)
+      ON CONFLICT(task_id) DO UPDATE SET
+        task_revision = excluded.task_revision,
+        agent_id = excluded.agent_id,
+        status = excluded.status,
+        attempt = excluded.attempt,
+        result = NULL,
+        error = NULL,
+        started_at = excluded.started_at,
+        finished_at = NULL,
+        updated_at = excluded.updated_at
+    `).run(record.taskId, record.taskRevision, record.agentId, record.status, record.attempt, record.startedAt, record.updatedAt);
+    db.exec("COMMIT");
+    return record;
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+export function finishTaskRun(taskId: string, taskRevision: number, outcome: { status: "completed"; result: string } | { status: "failed"; error: string }): TaskRunRecord | undefined {
+  const db = getDatabase();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const current = readTaskRun(db, taskId);
+    if (!current || current.taskRevision !== taskRevision) {
+      db.exec("ROLLBACK");
+      return current;
+    }
+    if (current.status === "completed" || current.status === "blocked") {
+      db.exec("COMMIT");
+      return current;
+    }
+    const now = new Date().toISOString();
+    const status = outcome.status === "failed" && current.attempt >= 3 ? "blocked" : outcome.status;
+    db.prepare("UPDATE task_runs SET status = ?, result = ?, error = ?, finished_at = ?, updated_at = ? WHERE task_id = ?").run(status, outcome.status === "completed" ? outcome.result : null, outcome.status === "failed" ? outcome.error : null, now, now, taskId);
+    db.exec("COMMIT");
+    return { ...current, status, ...(outcome.status === "completed" ? { result: outcome.result } : { error: outcome.error }), finishedAt: now, updatedAt: now };
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
 function getDatabase(): DatabaseSync {
   if (database) return database;
   mkdirSync(dataDirectory, { recursive: true });
@@ -173,7 +251,39 @@ function getDatabase(): DatabaseSync {
       updated_at TEXT NOT NULL
     );
   `);
+  applyMigration(database, 4, "task-run-ledger", `
+    CREATE TABLE IF NOT EXISTS task_runs (
+      task_id TEXT PRIMARY KEY,
+      task_revision INTEGER NOT NULL,
+      agent_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      attempt INTEGER NOT NULL,
+      result TEXT,
+      error TEXT,
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      updated_at TEXT NOT NULL
+    );
+  `);
   return database;
+}
+
+function readTaskRun(db: DatabaseSync, taskId: string): TaskRunRecord | undefined {
+  const row = db.prepare("SELECT task_id, task_revision, agent_id, status, attempt, result, error, started_at, finished_at, updated_at FROM task_runs WHERE task_id = ?").get(taskId) as Record<string, unknown> | undefined;
+  if (!row || typeof row.task_id !== "string" || typeof row.task_revision !== "number" || typeof row.agent_id !== "string" || typeof row.status !== "string" || typeof row.attempt !== "number" || typeof row.started_at !== "string" || typeof row.updated_at !== "string") return undefined;
+  if (row.status !== "active" && row.status !== "completed" && row.status !== "failed" && row.status !== "blocked") return undefined;
+  return {
+    taskId: row.task_id,
+    taskRevision: row.task_revision,
+    agentId: row.agent_id,
+    status: row.status,
+    attempt: row.attempt,
+    ...(typeof row.result === "string" ? { result: row.result } : {}),
+    ...(typeof row.error === "string" ? { error: row.error } : {}),
+    startedAt: row.started_at,
+    ...(typeof row.finished_at === "string" ? { finishedAt: row.finished_at } : {}),
+    updatedAt: row.updated_at,
+  };
 }
 
 function applyMigration(db: DatabaseSync, version: number, name: string, sql: string): void {

@@ -83,13 +83,27 @@ Implementation record:
 
 ### Phase 2 — Reliable orchestration engine
 
-Status: **Planned**
+Status: **In progress — task-run ledger slice implemented 2026-09-15**
 
+- [x] Add a durable task-run ledger and connect assigned agent runners to it.
 - [ ] Define durable task state transitions and acceptance criteria.
 - [ ] Add task dependencies, idempotency keys, retries, and cancellation.
 - [ ] Add a persistent worker/runner for queued agent tasks.
 - [ ] Detect stalled runs and resume interrupted sessions.
 - [ ] Make the Task Board a projection of orchestration state.
+
+Implementation record:
+
+1. Read the EVE session and streaming contract before connecting task execution;
+   task work uses a durable session and must tolerate reconnects and retries.
+2. Added migration 4 with a SQLite `task_runs` ledger keyed by task id and
+   revision, including agent, attempt, status, timestamps, result, and error.
+3. Added `POST /api/tasks` for idempotent claim, completion, and failure updates;
+   failures become blocked after three attempts.
+4. Connected the browser task runner to claim work before sending it to EVE and
+   record completion or failure after the model turn settles.
+5. Verification: task claim and completion returned HTTP 200, recorded attempt
+   1 and the result, and did not change the existing Task Board state.
 
 ### Phase 3 — Real workspace and file operations
 
