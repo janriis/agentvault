@@ -1,5 +1,5 @@
-import { VaultWorkspace } from "@/app/_components/vault-workspace";
+import { VaultWorkspaceClient } from "@/app/_components/vault-workspace-client";
 
 export default function Page() {
-  return <VaultWorkspace />;
+  return <VaultWorkspaceClient />;
 }
