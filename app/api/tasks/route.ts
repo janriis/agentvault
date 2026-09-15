@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { claimTaskRun, finishTaskRun, listTaskRuns } from "@/agent/lib/vault-database";
+import { cancelTaskRun, claimTaskRun, finishTaskRun, listTaskRuns } from "@/agent/lib/vault-database";
 
 export async function GET() {
   return NextResponse.json({ runs: listTaskRuns() });
@@ -20,6 +20,9 @@ export async function POST(request: Request) {
     }
     if (payload.action === "fail" && typeof payload.error === "string") {
       return NextResponse.json({ run: finishTaskRun(payload.taskId, payload.taskRevision as number, { status: "failed", error: payload.error }) });
+    }
+    if (payload.action === "cancel") {
+      return NextResponse.json({ run: cancelTaskRun(payload.taskId, payload.taskRevision as number) });
     }
     return NextResponse.json({ error: "Unsupported task action." }, { status: 400 });
   } catch {

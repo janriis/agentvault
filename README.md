@@ -119,6 +119,9 @@ manually. Use the **Task** button in a workshop room to create a task with that
 room's context; it will appear on the board with a room link. Open any task
 title or edit button to change its instructions, priority, or assignee. Editing
 an agent task queues it for another run with the new instructions.
+Active agent runs can be cancelled from their card, and blocked runs can be
+retried with a fresh revision. Durable run status is projected back onto the
+board so a refresh does not hide work already claimed by an agent.
 
 In a room, use **Task** to create a board item with the room attached. If an
 agent has already written task cards in the conversation, use **Extract tasks**

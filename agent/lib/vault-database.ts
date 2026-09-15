@@ -26,7 +26,7 @@ export interface TaskRunRecord {
   taskId: string;
   taskRevision: number;
   agentId: string;
-  status: "active" | "completed" | "failed" | "blocked";
+  status: "active" | "completed" | "failed" | "blocked" | "cancelled";
   attempt: number;
   result?: string;
   error?: string;
@@ -198,6 +198,15 @@ export function claimTaskRun(taskId: string, taskRevision: number, agentId: stri
   }
 }
 
+export function cancelTaskRun(taskId: string, taskRevision: number): TaskRunRecord | undefined {
+  const db = getDatabase();
+  const current = readTaskRun(db, taskId);
+  if (!current || current.taskRevision !== taskRevision || current.status !== "active") return current;
+  const now = new Date().toISOString();
+  db.prepare("UPDATE task_runs SET status = ?, finished_at = ?, updated_at = ? WHERE task_id = ?").run("cancelled", now, now, taskId);
+  return { ...current, status: "cancelled", finishedAt: now, updatedAt: now };
+}
+
 export function finishTaskRun(taskId: string, taskRevision: number, outcome: { status: "completed"; result: string } | { status: "failed"; error: string }): TaskRunRecord | undefined {
   const db = getDatabase();
   db.exec("BEGIN IMMEDIATE");
@@ -348,7 +357,7 @@ function readTaskRun(db: DatabaseSync, taskId: string): TaskRunRecord | undefine
 
 function parseTaskRunRow(row: Record<string, unknown>): TaskRunRecord | undefined {
   if (!row || typeof row.task_id !== "string" || typeof row.task_revision !== "number" || typeof row.agent_id !== "string" || typeof row.status !== "string" || typeof row.attempt !== "number" || typeof row.started_at !== "string" || typeof row.updated_at !== "string") return undefined;
-  if (row.status !== "active" && row.status !== "completed" && row.status !== "failed" && row.status !== "blocked") return undefined;
+  if (row.status !== "active" && row.status !== "completed" && row.status !== "failed" && row.status !== "blocked" && row.status !== "cancelled") return undefined;
   return {
     taskId: row.task_id,
     taskRevision: row.task_revision,
