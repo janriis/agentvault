@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { cancelTaskRun, claimTaskRun, finishTaskRun, listTaskRuns, TaskClaimError } from "@/agent/lib/vault-database";
+import { taskAgentRoute } from "@/agent/lib/task-orchestration";
+import { Client } from "eve/client";
 
 export async function GET() {
   return NextResponse.json({ runs: listTaskRuns() });
@@ -24,7 +26,20 @@ export async function POST(request: Request) {
       return run ? NextResponse.json({ run }) : NextResponse.json({ error: "This attempt is no longer active." }, { status: 409 });
     }
     if (payload.action === "cancel") {
-      return NextResponse.json({ run: cancelTaskRun(payload.taskId, payload.taskRevision as number) });
+      const run = cancelTaskRun(payload.taskId, payload.taskRevision as number);
+      if (!run) return NextResponse.json({ error: "This task attempt is no longer active." }, { status: 409 });
+      let cancellationWarning: string | undefined;
+      if (run.eveSessionId) {
+        const route = taskAgentRoute(run.agentId);
+        const client = new Client({
+          host: `${new URL(request.url).origin}/eve/agents/${route}`,
+          ...(route === "custom" ? { headers: { "x-vault-agent-id": run.agentId } } : {}),
+          redirect: "error",
+        });
+        try { await client.sessions.attach(run.eveSessionId).cancel({ tasks: true }); }
+        catch { cancellationWarning = "The run was fenced, but EVE did not confirm cancellation. Its session may still be settling."; }
+      }
+      return NextResponse.json({ run, ...(cancellationWarning ? { warning: cancellationWarning } : {}) });
     }
     return NextResponse.json({ error: "Unsupported task action." }, { status: 400 });
   } catch (error) {

@@ -107,7 +107,7 @@ Status: **In progress — task-run ledger and board projection slices implemente
 - [x] Fence task results to the active attempt and saved task revision.
 - [ ] Define durable task state transitions and acceptance criteria.
 - [ ] Add task dependencies, idempotency keys, retries, and cancellation.
-- [ ] Add a persistent worker/runner for queued agent tasks.
+- [x] Add a local persistent worker/runner for queued agent tasks.
 - [ ] Detect stalled runs and resume interrupted sessions.
 - [ ] Make the Task Board a projection of orchestration state.
 
@@ -140,6 +140,25 @@ Implementation record:
 13. Verification: five focused unit and isolated SQLite integration checks
     passed, plus TypeScript and a production build. The built UI exposed the
     prerequisite field in the Task Board editor.
+14. Added a standalone local task worker using `eve/client`. Development starts
+    it with the web server; a separate `npm run worker -- --host ...` command
+    supports an independently hosted local server. The worker checks EVE
+    health before claiming, polls SQLite rather than browser state, and uses
+    the same model and role context as room/task agent turns.
+15. Added migration 6 for each task run's EVE session identity, plus an
+    attempt-fenced heartbeat. On a stale active run, the worker inspects the
+    durable EVE stream before attempting a replacement session; a completed
+    result is committed against the original attempt. Missing sessions become
+    failed runs rather than launching an unbounded duplicate.
+16. A completed ledger run unlocks dependent tasks without requiring an open
+    browser to project the completed status onto the Task Board.
+17. Cancellation now fences the ledger attempt first, then requests EVE turn
+    cancellation when a session is known. The UI moves a card only after the
+    server accepts cancellation and surfaces a warning if EVE did not confirm.
+18. Verification: seven focused unit/SQLite checks and TypeScript passed. A
+    production build succeeded after the sandbox permitted Next's local CSS
+    processor. The worker started against an isolated empty database, and the
+    live Task Board remained readable after the browser runner was removed.
 
 ### Phase 3 — Real workspace and file operations
 

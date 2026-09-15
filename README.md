@@ -15,9 +15,14 @@ npm run typecheck
 npm run dev
 ```
 
-Open the web app at [http://localhost:3000](http://localhost:3000). If that port
-is busy, Next.js will choose the next available port. For EVE's interactive
-terminal instead, run `npm run dev:eve`.
+Open the web app at [http://localhost:3000](http://localhost:3000). The development
+command starts both the web server and a local task worker. To choose another
+port, pass it explicitly, for example `npm run dev -- -p 3001`; the worker will
+use the same port. For EVE's interactive terminal instead, run `npm run dev:eve`.
+For a separately hosted web server, run `npm run worker -- --host http://127.0.0.1:3001`
+in its own terminal. The worker and web server must use the same
+`AGENT_VAULT_DATA_DIR`; keep the worker process running to execute tasks when
+no browser is open.
 
 The home screen is the Agent Vault workspace. It includes the Agent Library,
 Agent Spawner, Workshop Rooms, Room Roles, Task Board, Shared Artifacts, and
@@ -31,9 +36,9 @@ login and does not require an API key. If EVE asks you to authenticate, open
 Open **Settings** in the workspace navigation to configure the vault name,
 default provider, Ollama address, task attempt and timeout policies, automatic
 backup interval, and confirmation policy. These settings are stored in the
-durable SQLite backend rather than browser state. Maximum task attempts and
-automatic backup scheduling are active now; timeout and confirmation settings
-are recorded as the central policy for the persistent worker and safety engine.
+durable SQLite backend rather than browser state. Maximum task attempts, task
+timeouts, and automatic backup scheduling are active; confirmation settings
+are recorded for the centralized safety engine.
 
 ## Use local Ollama models
 
@@ -111,9 +116,11 @@ another.
 
 The **Task Board** supports queued, active, blocked, and completed work. Use
 **Assign task**, choose **Agent** or **Person**, select the assignee, and set a
-priority. Agent-owned tasks can be picked up by the EVE workflow when task
-execution is connected; in the web workspace they start through the assigned
-agent's EVE route and record the result on the task. Person-owned tasks are
+priority. Agent-owned tasks are picked up by the background worker through
+the assigned agent's EVE route, even when the browser is closed. The worker
+checks EVE availability before claiming work, records its EVE session and
+heartbeat, and retries failed work after a short backoff up to the saved
+attempt limit. Person-owned tasks are
 tracked for human follow-up and can be moved through the same status columns
 manually. Use the **Task** button in a workshop room to create a task with that
 room's context; it will appear on the board with a room link. Open any task

@@ -994,9 +994,14 @@ export function VaultWorkspace() {
   };
 
   const cancelTaskRun = (task: Task) => {
-    void fetch("/api/tasks", { body: JSON.stringify({ action: "cancel", taskId: task.id, taskRevision: task.revision ?? 0 }), headers: { "Content-Type": "application/json" }, method: "POST" }).catch(() => undefined);
-    updateTaskStatus(task.id, "blocked");
-    addActivity({ title: `${task.title} was cancelled`, detail: "The active agent run was stopped by the user.", kind: "safety" });
+    void fetch("/api/tasks", { body: JSON.stringify({ action: "cancel", taskId: task.id, taskRevision: task.revision ?? 0 }), headers: { "Content-Type": "application/json" }, method: "POST" })
+      .then(async (response) => {
+        const payload = await response.json() as { error?: string; warning?: string };
+        if (!response.ok) throw new Error(payload.error ?? "The active run could not be cancelled.");
+        updateTaskStatus(task.id, "blocked");
+        addActivity({ title: `${task.title} was cancelled`, detail: payload.warning ?? "The active agent run was stopped by the user.", kind: "safety" });
+      })
+      .catch((error: unknown) => addActivity({ title: `${task.title} could not be cancelled`, detail: error instanceof Error ? error.message : "Please try again.", kind: "failure" }));
   };
 
   const retryTaskRun = (task: Task) => {
@@ -1289,11 +1294,6 @@ export function VaultWorkspace() {
         onSelected={handleWorkspaceChanged}
         open={showWorkspaceSettings}
       />
-      {backendReady && tasks.filter((task) => task.assigneeType === "agent" && (task.status === "queued" || task.status === "active") && unmetTaskDependencies(task, tasks).length === 0).map((task) => {
-        const agent = agents.find((item) => item.id === task.assigneeId);
-        if (!agent) return null;
-        return <TaskAgentRunner agent={agent} key={`${task.id}:${task.revision ?? 0}`} onComplete={completeTask} onFailure={blockTask} onStart={startTask} room={rooms.find((item) => item.id === task.roomId)} task={task} />;
-      })}
       <Dialog open={safetyRequest !== undefined} onOpenChange={(open) => !open && setSafetyRequest(undefined)}>
         <DialogContent>
           <DialogHeader>

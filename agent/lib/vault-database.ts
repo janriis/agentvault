@@ -31,6 +31,7 @@ export interface TaskRunRecord {
   attempt: number;
   result?: string;
   error?: string;
+  eveSessionId?: string;
   startedAt: string;
   finishedAt?: string;
   updatedAt: string;
@@ -186,13 +187,18 @@ export function claimTaskRun(taskId: string, taskRevision: number, agentId: stri
       throw new TaskClaimError("The saved task assignment or revision does not match this claim.");
     }
     if (task.status !== "queued" && task.status !== "active") throw new TaskClaimError("This task is not ready to run.");
-    const waitingFor = unmetTaskDependencies(task, tasks);
+    const waitingFor = unmetTaskDependencies(task, tasks).filter((id) => {
+      const dependency = tasks.find((candidate) => candidate.id === id);
+      const run = readTaskRun(db, id);
+      return !dependency || !run || run.status !== "completed" || run.taskRevision !== (dependency.revision ?? 0);
+    });
     if (waitingFor.length > 0) throw new TaskClaimError(`Waiting for prerequisites: ${waitingFor.join(", ")}.`);
     const current = readTaskRun(db, taskId);
     const timeoutMs = getVaultSettings().taskTimeoutMinutes * 60_000;
     const activeRunIsFresh = current?.status === "active" && Date.now() - Date.parse(current.updatedAt) < timeoutMs;
     if (current && current.taskRevision === taskRevision && activeRunIsFresh) throw new TaskClaimError("Another runner already owns this task.");
     if (current && current.taskRevision === taskRevision && (current.status === "completed" || current.status === "blocked" || current.status === "cancelled")) throw new TaskClaimError("This run is already finished. Retry with a new task revision.");
+    if (current && current.taskRevision === taskRevision && current.attempt >= getVaultSettings().maxTaskAttempts) throw new TaskClaimError("This task has reached its maximum attempt count.");
     const now = new Date().toISOString();
     const record: TaskRunRecord = {
       taskId,
@@ -204,8 +210,8 @@ export function claimTaskRun(taskId: string, taskRevision: number, agentId: stri
       updatedAt: now,
     };
     db.prepare(`
-      INSERT INTO task_runs (task_id, task_revision, agent_id, status, attempt, result, error, started_at, finished_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, NULL, ?)
+      INSERT INTO task_runs (task_id, task_revision, agent_id, status, attempt, result, error, eve_session_id, started_at, finished_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, ?)
       ON CONFLICT(task_id) DO UPDATE SET
         task_revision = excluded.task_revision,
         agent_id = excluded.agent_id,
@@ -213,6 +219,7 @@ export function claimTaskRun(taskId: string, taskRevision: number, agentId: stri
         attempt = excluded.attempt,
         result = NULL,
         error = NULL,
+        eve_session_id = NULL,
         started_at = excluded.started_at,
         finished_at = NULL,
         updated_at = excluded.updated_at
@@ -225,12 +232,25 @@ export function claimTaskRun(taskId: string, taskRevision: number, agentId: stri
   }
 }
 
+export function attachTaskRunSession(taskId: string, taskRevision: number, attempt: number, eveSessionId: string): TaskRunRecord | undefined {
+  const db = getDatabase();
+  const updatedAt = new Date().toISOString();
+  const updated = db.prepare("UPDATE task_runs SET eve_session_id = ?, updated_at = ? WHERE task_id = ? AND task_revision = ? AND attempt = ? AND status = 'active'").run(eveSessionId, updatedAt, taskId, taskRevision, attempt);
+  return updated.changes === 1 ? readTaskRun(db, taskId) : undefined;
+}
+
+export function heartbeatTaskRun(taskId: string, taskRevision: number, attempt: number): boolean {
+  const updated = getDatabase().prepare("UPDATE task_runs SET updated_at = ? WHERE task_id = ? AND task_revision = ? AND attempt = ? AND status = 'active'").run(new Date().toISOString(), taskId, taskRevision, attempt);
+  return updated.changes === 1;
+}
+
 export function cancelTaskRun(taskId: string, taskRevision: number): TaskRunRecord | undefined {
   const db = getDatabase();
   const current = readTaskRun(db, taskId);
-  if (!current || current.taskRevision !== taskRevision || current.status !== "active") return current;
+  if (!current || current.taskRevision !== taskRevision || current.status !== "active") return undefined;
   const now = new Date().toISOString();
-  db.prepare("UPDATE task_runs SET status = ?, finished_at = ?, updated_at = ? WHERE task_id = ?").run("cancelled", now, now, taskId);
+  const updated = db.prepare("UPDATE task_runs SET status = ?, finished_at = ?, updated_at = ? WHERE task_id = ? AND task_revision = ? AND attempt = ? AND status = 'active'").run("cancelled", now, now, taskId, taskRevision, current.attempt);
+  if (updated.changes !== 1) return undefined;
   return { ...current, status: "cancelled", finishedAt: now, updatedAt: now };
 }
 
@@ -255,7 +275,7 @@ export function finishTaskRun(taskId: string, taskRevision: number, attempt: num
 }
 
 export function listTaskRuns(): TaskRunRecord[] {
-  return getDatabase().prepare("SELECT task_id, task_revision, agent_id, status, attempt, result, error, started_at, finished_at, updated_at FROM task_runs ORDER BY updated_at DESC").all().flatMap((row) => parseTaskRunRow(row as Record<string, unknown>) ?? []);
+  return getDatabase().prepare("SELECT task_id, task_revision, agent_id, status, attempt, result, error, eve_session_id, started_at, finished_at, updated_at FROM task_runs ORDER BY updated_at DESC").all().flatMap((row) => parseTaskRunRow(row as Record<string, unknown>) ?? []);
 }
 
 export function getVaultSettings(): VaultSettings {
@@ -339,6 +359,9 @@ function getDatabase(): DatabaseSync {
       updated_at TEXT NOT NULL
     );
   `);
+  applyMigration(database, 6, "task-eve-session", `
+    ALTER TABLE task_runs ADD COLUMN eve_session_id TEXT;
+  `);
   return database;
 }
 
@@ -374,7 +397,7 @@ function integerInRange(value: unknown, min: number, max: number, fallback: numb
 }
 
 function readTaskRun(db: DatabaseSync, taskId: string): TaskRunRecord | undefined {
-  const row = db.prepare("SELECT task_id, task_revision, agent_id, status, attempt, result, error, started_at, finished_at, updated_at FROM task_runs WHERE task_id = ?").get(taskId) as Record<string, unknown> | undefined;
+  const row = db.prepare("SELECT task_id, task_revision, agent_id, status, attempt, result, error, eve_session_id, started_at, finished_at, updated_at FROM task_runs WHERE task_id = ?").get(taskId) as Record<string, unknown> | undefined;
   return row ? parseTaskRunRow(row) : undefined;
 }
 
@@ -389,6 +412,7 @@ function parseTaskRunRow(row: Record<string, unknown>): TaskRunRecord | undefine
     attempt: row.attempt,
     ...(typeof row.result === "string" ? { result: row.result } : {}),
     ...(typeof row.error === "string" ? { error: row.error } : {}),
+    ...(typeof row.eve_session_id === "string" ? { eveSessionId: row.eve_session_id } : {}),
     startedAt: row.started_at,
     ...(typeof row.finished_at === "string" ? { finishedAt: row.finished_at } : {}),
     updatedAt: row.updated_at,
