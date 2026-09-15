@@ -23,6 +23,7 @@ import { Shimmer } from "@/components/ai-elements/shimmer";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { AgentMessage } from "./agent-message";
+import { ThemeSwitcher } from "./theme-provider";
 
 const AGENT_NAME = "Agent Vault";
 const CHATGPT_MODEL_ID = "chatgpt-subscription";
@@ -429,6 +430,9 @@ function ChatHeader({
           <AgentPicker agents={agents} onChange={onAgentChange} selectedAgentId={selectedAgentId} />
           <ModelPicker localModels={localModels} loading={modelsLoading} onChange={onModelChange} selectedModelId={selectedModelId} />
         </div>
+        <div className="pointer-events-auto absolute top-3 right-32">
+          <ThemeSwitcher />
+        </div>
         {canStartNewChat ? (
           <Button
             aria-label="Start a new chat"
@@ -483,7 +487,7 @@ function ModelPicker({
           </optgroup>
         ) : null}
       </select>
-      <span aria-live="polite" className="hidden text-muted-foreground/70 lg:inline">
+      <span aria-live="polite" className="hidden text-muted-foreground lg:inline">
         {loading ? "Scanning…" : localModels.length > 0 ? `${localModels.length} local` : "Ollama offline"}
       </span>
     </label>

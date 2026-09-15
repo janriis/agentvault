@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { ThemeProvider } from "@/app/_components/theme-provider";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -12,7 +13,7 @@ export default function RootLayout({ children }: { readonly children: ReactNode 
   return (
     <html lang="en">
       <body>
-        <TooltipProvider>{children}</TooltipProvider>
+        <ThemeProvider><TooltipProvider>{children}</TooltipProvider></ThemeProvider>
       </body>
     </html>
   );
