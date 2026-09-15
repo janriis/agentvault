@@ -3,6 +3,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { unmetTaskDependencies, validateTaskDependencies } from "./task-dependencies.ts";
 import { projectTaskRuns, type ProjectableTask } from "./task-projection.ts";
+import { applyTaskBoardCommand, TaskCommandConflictError, type BoardTask, type TaskBoardCommand } from "./task-commands.ts";
 
 export interface PersistedVaultState {
   agents: unknown[];
@@ -118,6 +119,39 @@ export function saveVaultState(state: PersistedVaultState, expectedRevision?: nu
 
 function projectVaultState(state: PersistedVaultState): PersistedVaultState {
   return { ...state, tasks: projectTaskRuns(state.tasks as ProjectableTask[], listTaskRuns()) };
+}
+
+export function executeTaskBoardCommand(idempotencyKey: string, command: TaskBoardCommand): { record: VaultStateRecord; task: BoardTask; cancelledRun?: TaskRunRecord; replayed: boolean } {
+  if (!/^[a-zA-Z0-9_-]{8,120}$/u.test(idempotencyKey)) throw new TaskCommandConflictError("A valid idempotency key is required.");
+  const db = getDatabase();
+  const commandJson = JSON.stringify(command);
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const prior = db.prepare("SELECT command_json, response_json FROM task_commands WHERE idempotency_key = ?").get(idempotencyKey) as { command_json: string; response_json: string } | undefined;
+    if (prior) {
+      if (prior.command_json !== commandJson) throw new TaskCommandConflictError("This idempotency key was already used for another task action.");
+      const response = JSON.parse(prior.response_json) as { task: BoardTask; cancelledRun?: TaskRunRecord };
+      const record = getVaultState();
+      if (!record) throw new Error("The vault state is unavailable.");
+      db.exec("COMMIT");
+      return { ...response, record, replayed: true };
+    }
+    const current = getVaultState();
+    if (!current) throw new TaskCommandConflictError("The vault has not been initialized yet.");
+    const result = applyTaskBoardCommand(current.state.tasks as BoardTask[], listTaskRuns(), command);
+    const cancelledRun = result.cancelRun ? cancelTaskRun(result.cancelRun.taskId, result.cancelRun.taskRevision) : undefined;
+    const nextState = projectVaultState({ ...current.state, tasks: result.tasks });
+    const revision = current.revision + 1;
+    const updatedAt = new Date().toISOString();
+    db.prepare("UPDATE vault_state SET state_json = ?, revision = ?, updated_at = ? WHERE id = ?").run(JSON.stringify(nextState), revision, updatedAt, "default");
+    const response = { task: result.task, ...(cancelledRun ? { cancelledRun } : {}) };
+    db.prepare("INSERT INTO task_commands (idempotency_key, command_json, response_json, created_at) VALUES (?, ?, ?, ?)").run(idempotencyKey, commandJson, JSON.stringify(response), updatedAt);
+    db.exec("COMMIT");
+    return { ...response, record: { state: nextState, revision, updatedAt }, replayed: false };
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
 }
 
 export function listDatabaseAgents(): DatabaseJsonRecord[] {
@@ -305,6 +339,8 @@ export function restoreVaultStateWithRuns(state: PersistedVaultState, runs: Task
   try {
     const current = db.prepare("SELECT revision FROM vault_state WHERE id = ?").get("default") as { revision?: number } | undefined;
     const revision = (current?.revision ?? 0) + 1;
+    // Imported state starts a new command history; stale responses must never replay.
+    db.exec("DELETE FROM task_commands");
     db.exec("DELETE FROM task_runs");
     insertTaskRuns(db, runs);
     const projectedState = projectVaultState(state);
@@ -406,6 +442,14 @@ function getDatabase(): DatabaseSync {
   `);
   applyMigration(database, 6, "task-eve-session", `
     ALTER TABLE task_runs ADD COLUMN eve_session_id TEXT;
+  `);
+  applyMigration(database, 7, "task-board-commands", `
+    CREATE TABLE IF NOT EXISTS task_commands (
+      idempotency_key TEXT PRIMARY KEY,
+      command_json TEXT NOT NULL,
+      response_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
   `);
   return database;
 }

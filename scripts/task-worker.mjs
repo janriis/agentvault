@@ -1,7 +1,7 @@
 import { Client } from "eve/client";
 import { setTimeout as delay } from "node:timers/promises";
-import { buildWorkerTaskPrompt, findRunnableJobs, runWorkerJob, taskAgentRoute, workerModelContext } from "../agent/lib/task-orchestration.ts";
-import { attachTaskRunSession, finishTaskRun, heartbeatTaskRun } from "../agent/lib/vault-database.ts";
+import { buildWorkerTaskPrompt, classifyTaskSessionEvents, findRunnableJobs, runWorkerJob, taskAgentRoute, taskSessionExpired, workerModelContext } from "../agent/lib/task-orchestration.ts";
+import { attachTaskRunSession, finishTaskRun, getVaultSettings, heartbeatTaskRun } from "../agent/lib/vault-database.ts";
 
 const hostArg = process.argv.indexOf("--host");
 const host = hostArg >= 0 ? process.argv[hostArg + 1] : process.env.AGENT_VAULT_APP_URL;
@@ -45,7 +45,21 @@ async function execute(job, run) {
     }
   }, 30_000);
   let result;
-  try { result = await response.result(); } finally { clearInterval(heartbeat); }
+  let timeout;
+  try {
+    result = await Promise.race([
+      response.result(),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error("The EVE session exceeded the configured task timeout.")), getVaultSettings().taskTimeoutMinutes * 60_000);
+      }),
+    ]);
+  } catch (error) {
+    await session.cancel({ tasks: true }).catch(() => undefined);
+    throw error;
+  } finally {
+    clearInterval(heartbeat);
+    clearTimeout(timeout);
+  }
   if (result.status === "failed") throw new Error("The EVE session failed.");
   return result.message ?? "";
 }
@@ -66,15 +80,18 @@ while (!stopping) {
         const session = client.sessions.attach(job.previousRun.eveSessionId);
         try {
           const snapshot = await session.snapshot();
-          const events = snapshot.events;
-          const settled = events.some((event) => event.type === "turn.completed" || event.type === "session.completed" || event.type === "session.failed" || event.type === "turn.failed");
-          if (settled) {
-            const failed = events.some((event) => event.type === "session.failed" || event.type === "turn.failed");
-            const message = [...events].reverse().find((event) => event.type === "message.completed" && event.data.finishReason !== "tool-calls")?.data.message;
-            finishTaskRun(job.task.id, job.previousRun.taskRevision, job.previousRun.attempt, failed || !message ? { status: "failed", error: failed ? "The resumed EVE session failed." : "The resumed EVE session returned no result." } : { status: "completed", result: message });
+          const outcome = classifyTaskSessionEvents(snapshot.events);
+          if (outcome.status !== "pending") {
+            finishTaskRun(job.task.id, job.previousRun.taskRevision, job.previousRun.attempt, outcome.status === "failed" ? { status: "failed", error: outcome.error } : { status: "completed", result: outcome.result });
+            continue;
+          }
+          if (taskSessionExpired(job.previousRun, getVaultSettings().taskTimeoutMinutes)) {
+            finishTaskRun(job.task.id, job.previousRun.taskRevision, job.previousRun.attempt, { status: "failed", error: "The EVE session exceeded the configured task timeout." });
+            await session.cancel({ tasks: true }).catch(() => undefined);
             continue;
           }
           // The durable EVE turn is still running or awaiting input. Do not create a second session.
+          heartbeatTaskRun(job.task.id, job.previousRun.taskRevision, job.previousRun.attempt);
           continue;
         } catch (error) {
           process.stderr.write(`Could not inspect EVE session ${job.previousRun.eveSessionId}: ${error instanceof Error ? error.message : String(error)}\n`);

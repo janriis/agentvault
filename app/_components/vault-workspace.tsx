@@ -53,6 +53,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { unmetTaskDependencies, validateTaskDependencies } from "@/agent/lib/task-dependencies";
 import { projectTaskRuns, type ProjectableRun } from "@/agent/lib/task-projection";
+import type { TaskBoardCommand } from "@/agent/lib/task-commands";
 
 type Section = "overview" | "library" | "rooms" | "tasks" | "artifacts" | "activity" | "settings";
 type AgentStatus = "idle" | "working" | "paused" | "blocked";
@@ -205,6 +206,10 @@ interface VaultStateResponse {
 
 const STORAGE_KEY = "agent-vault-workspace-v1";
 const EMPTY_PERSON_IDS: string[] = [];
+
+function sameJson(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
 
 async function persistArtifact(artifact: Artifact, method: "POST" | "PUT"): Promise<void> {
   const response = await fetch("/api/artifacts", {
@@ -458,9 +463,14 @@ export function VaultWorkspace() {
   const [showWorkspaceSettings, setShowWorkspaceSettings] = useState(false);
   const [workspace, setWorkspace] = useState<WorkspaceConfig>();
   const [backendReady, setBackendReady] = useState(false);
+  const [taskActionPending, setTaskActionPending] = useState(false);
+  const [taskActionError, setTaskActionError] = useState<string>();
   const [taskRoomId, setTaskRoomId] = useState<string>();
   const artifactSaveTimers = useRef<Record<string, number>>({});
   const backendRevision = useRef(0);
+  const lastPersistedSnapshot = useRef("");
+  const taskCommandQueue = useRef<Promise<void>>(Promise.resolve());
+  const queuedTaskCommands = useRef(0);
   const [safetyRequest, setSafetyRequest] = useState<{
     title: string;
     detail: string;
@@ -505,6 +515,45 @@ export function VaultWorkspace() {
     setSettings(payload.settings);
   };
 
+  const sendTaskBoardCommand = async (command: TaskBoardCommand): Promise<Task> => {
+    if (!backendReady) throw new Error("The vault is still loading. Try again in a moment.");
+    const idempotencyKey = crypto.randomUUID();
+    const body = JSON.stringify({ idempotencyKey, command });
+    queuedTaskCommands.current += 1;
+    setTaskActionPending(true);
+    const execute = async (): Promise<Task> => {
+      setTaskActionError(undefined);
+      try {
+      let response: Response;
+      try {
+        response = await fetch("/api/task-board", { body, headers: { "Content-Type": "application/json" }, method: "POST" });
+      } catch {
+        // Retrying the same key cannot duplicate a command accepted before the connection dropped.
+        response = await fetch("/api/task-board", { body, headers: { "Content-Type": "application/json" }, method: "POST" });
+      }
+      const payload = await response.json() as { error?: string; warning?: string; task?: Task; record?: { revision: number; state: VaultStatePayload } };
+      if (!response.ok || !payload.task || !payload.record) throw new Error(payload.error ?? "The task action could not be saved.");
+      backendRevision.current = payload.record.revision;
+      lastPersistedSnapshot.current = JSON.stringify(payload.record.state);
+      setTasks(payload.record.state.tasks);
+      if (payload.warning) addActivity({ title: "EVE cancellation is still settling", detail: payload.warning, kind: "safety" });
+      return payload.task;
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : "The task action could not be saved.";
+        setTaskActionError(detail);
+        throw error;
+      }
+    };
+    const job = taskCommandQueue.current.then(execute);
+    taskCommandQueue.current = job.then(() => undefined, () => undefined);
+    try {
+      return await job;
+    } finally {
+      queuedTaskCommands.current -= 1;
+      setTaskActionPending(queuedTaskCommands.current > 0);
+    }
+  };
+
   useEffect(() => {
     let cancelled = false;
     let legacyState: VaultStatePayload | undefined;
@@ -539,6 +588,7 @@ export function VaultWorkspace() {
         if (payload?.record?.state && isVaultStatePayload(payload.record.state)) {
           applyState(payload.record.state);
           backendRevision.current = payload.record.revision ?? 0;
+          lastPersistedSnapshot.current = JSON.stringify(payload.record.state);
           setBackendReady(true);
           return;
         }
@@ -559,6 +609,7 @@ export function VaultWorkspace() {
         if (saveResponse.ok) {
           const saved = await saveResponse.json() as { record?: { revision?: number } };
           backendRevision.current = saved.record?.revision ?? 0;
+          lastPersistedSnapshot.current = JSON.stringify(state);
         }
         setBackendReady(true);
       })
@@ -629,6 +680,8 @@ export function VaultWorkspace() {
 
   useEffect(() => {
     if (!backendReady) return;
+    const snapshot = JSON.stringify({ agents, people, rooms, tasks, activity });
+    if (snapshot === lastPersistedSnapshot.current) return;
     const timer = window.setTimeout(() => {
       void fetch("/api/vault-state", {
         body: JSON.stringify({
@@ -639,20 +692,24 @@ export function VaultWorkspace() {
         method: "POST",
       })
         .then(async (response) => {
-          if (response.ok) return await response.json() as VaultStateResponse;
+          if (response.ok) return { payload: await response.json() as VaultStateResponse, conflict: false };
           if (response.status !== 409) return null;
           const latestResponse = await fetch("/api/vault-state", { cache: "no-store" });
-          return latestResponse.ok ? await latestResponse.json() as VaultStateResponse : null;
+          return latestResponse.ok ? { payload: await latestResponse.json() as VaultStateResponse, conflict: true } : null;
         })
-        .then((payload) => {
-          const record = payload?.record;
+        .then((result) => {
+          const record = result?.payload.record;
+          const savedState = record?.state;
           if (record?.revision !== undefined) backendRevision.current = record.revision;
-          if (record?.state && isVaultStatePayload(record.state)) {
-            setAgents(record.state.agents);
-            setPeople(record.state.people);
-            setRooms(record.state.rooms);
-            setTasks(record.state.tasks);
-            setActivity(record.state.activity);
+          if (savedState && isVaultStatePayload(savedState)) {
+            lastPersistedSnapshot.current = JSON.stringify(savedState);
+            if (result?.conflict) {
+              setAgents((current) => sameJson(current, savedState.agents) ? current : savedState.agents);
+              setPeople((current) => sameJson(current, savedState.people) ? current : savedState.people);
+              setRooms((current) => sameJson(current, savedState.rooms) ? current : savedState.rooms);
+              setActivity((current) => sameJson(current, savedState.activity) ? current : savedState.activity);
+            }
+            setTasks((current) => sameJson(current, savedState.tasks) ? current : savedState.tasks);
           }
         })
         .catch(() => undefined);
@@ -829,8 +886,8 @@ export function VaultWorkspace() {
     });
   };
 
-  const createTask = (task: Task) => {
-    setTasks((current) => [task, ...current]);
+  const createTask = async (task: Task): Promise<void> => {
+    await sendTaskBoardCommand({ action: "create", task });
     addActivity({
       title: `${task.title} was assigned`,
       detail: `Assigned to ${taskAssigneeName(task, agents, people)}.`,
@@ -841,49 +898,22 @@ export function VaultWorkspace() {
     setSection("tasks");
   };
 
-  const updateTask = (updatedTask: Task) => {
+  const updateTask = async (updatedTask: Task): Promise<void> => {
     const existingTask = tasks.find((task) => task.id === updatedTask.id);
     if (!existingTask) return;
     const graphError = validateTaskDependencies(tasks.map((task) => task.id === updatedTask.id ? updatedTask : task));
     if (graphError) {
       addActivity({ title: "Task prerequisites were not saved", detail: graphError, kind: "failure" });
-      return;
+      throw new Error(graphError);
     }
     const shouldRunAgent = updatedTask.assigneeType === "agent";
-    const nextTask: Task = {
-      ...updatedTask,
-      status: shouldRunAgent ? "queued" : updatedTask.status,
-      updated: "Just now",
-      revision: (existingTask.revision ?? 0) + 1,
-    };
-    setTasks((current) => current.map((task) => (task.id === nextTask.id ? nextTask : task)));
+    const nextTask = await sendTaskBoardCommand({ action: "edit", task: updatedTask, expectedTaskRevision: existingTask.revision ?? 0 });
     addActivity({
       title: `${nextTask.title} was updated`,
       detail: shouldRunAgent ? "New instructions queued for the assigned agent." : "Task instructions updated.",
       kind: "decision",
       agent: shouldRunAgent ? taskAssigneeName(nextTask, agents, people) : undefined,
     });
-  };
-
-  const startTask = (taskId: string, revision: number) => {
-    const task = tasks.find((item) => item.id === taskId);
-    if (!task || (task.revision ?? 0) !== revision || task.status === "active") return;
-    setTasks((current) => current.map((item) => item.id === taskId ? { ...item, status: "active", updated: "Just now" } : item));
-    addActivity({ title: `${taskAssigneeName(task, agents, people)} started ${task.title}`, detail: task.description, kind: "progress", agent: taskAssigneeName(task, agents, people) });
-  };
-
-  const completeTask = (taskId: string, revision: number, result: string) => {
-    const task = tasks.find((item) => item.id === taskId);
-    if (!task || (task.revision ?? 0) !== revision || task.status === "completed" || task.status === "blocked") return;
-    setTasks((current) => current.map((item) => item.id === taskId ? { ...item, status: "completed", result, updated: "Just now" } : item));
-    addActivity({ title: `${taskAssigneeName(task, agents, people)} completed ${task.title}`, detail: result, kind: "progress", agent: taskAssigneeName(task, agents, people) });
-  };
-
-  const blockTask = (taskId: string, revision: number, detail: string) => {
-    const task = tasks.find((item) => item.id === taskId);
-    if (!task || (task.revision ?? 0) !== revision || task.status === "completed" || task.status === "blocked") return;
-    setTasks((current) => current.map((item) => item.id === taskId ? { ...item, status: "blocked", updated: "Just now" } : item));
-    addActivity({ title: `${taskAssigneeName(task, agents, people)} could not complete ${task.title}`, detail, kind: "failure", agent: taskAssigneeName(task, agents, people) });
   };
 
   const createArtifact = () => {
@@ -943,8 +973,23 @@ export function VaultWorkspace() {
       addActivity({ title: "Task board already up to date", detail: `The task cards from ${room.name} are already on the board.`, kind: "decision" });
       return;
     }
-    setTasks((current) => [...newTasks.filter((task) => !current.some((item) => item.sourceKey === task.sourceKey)), ...current]);
-    addActivity({ title: `${newTasks.length} task${newTasks.length === 1 ? "" : "s"} added from ${room.name}`, detail: "Task cards were extracted from the workshop conversation.", kind: "decision" });
+    void (async () => {
+      let added = 0;
+      for (const task of newTasks) {
+        try {
+          await sendTaskBoardCommand({ action: "create", task });
+          added += 1;
+        } catch (error) {
+          if (error instanceof Error && error.message.includes("already added")) {
+            setTaskActionError(undefined);
+            continue;
+          }
+          addActivity({ title: "Room task could not be saved", detail: error instanceof Error ? error.message : task.title, kind: "failure" });
+          return;
+        }
+      }
+      if (added > 0) addActivity({ title: `${added} task${added === 1 ? "" : "s"} added from ${room.name}`, detail: "Task cards were saved from the workshop conversation.", kind: "decision" });
+    })();
   };
 
   const appendRoomAgentMessage = (roomId: string, agentId: string, content: string) => {
@@ -982,31 +1027,21 @@ export function VaultWorkspace() {
   const updateTaskStatus = (taskId: string, status: TaskStatus) => {
     const task = tasks.find((item) => item.id === taskId);
     if (!task || task.status === status) return;
-    setTasks((current) =>
-      current.map((item) => (item.id === taskId ? { ...item, status, updated: "Just now" } : item)),
-    );
-    addActivity({
-      title: `Task moved to ${status}`,
-      detail: task.title,
-      kind: status === "blocked" ? "failure" : "progress",
-    });
+    void sendTaskBoardCommand({ action: "move", taskId, target: status, expectedTaskRevision: task.revision ?? 0 })
+      .then((saved) => addActivity({ title: `Task moved to ${saved.status}`, detail: task.title, kind: saved.status === "blocked" ? "failure" : "progress" }))
+      .catch(() => undefined);
   };
 
   const cancelTaskRun = (task: Task) => {
-    void fetch("/api/tasks", { body: JSON.stringify({ action: "cancel", taskId: task.id, taskRevision: task.revision ?? 0 }), headers: { "Content-Type": "application/json" }, method: "POST" })
-      .then(async (response) => {
-        const payload = await response.json() as { error?: string; warning?: string };
-        if (!response.ok) throw new Error(payload.error ?? "The active run could not be cancelled.");
-        updateTaskStatus(task.id, "blocked");
-        addActivity({ title: `${task.title} was cancelled`, detail: payload.warning ?? "The active agent run was stopped by the user.", kind: "safety" });
-      })
-      .catch((error: unknown) => addActivity({ title: `${task.title} could not be cancelled`, detail: error instanceof Error ? error.message : "Please try again.", kind: "failure" }));
+    void sendTaskBoardCommand({ action: "move", taskId: task.id, target: "blocked", expectedTaskRevision: task.revision ?? 0 })
+      .then(() => addActivity({ title: `${task.title} was cancelled`, detail: "The active agent run was stopped by the user.", kind: "safety" }))
+      .catch(() => undefined);
   };
 
   const retryTaskRun = (task: Task) => {
-    const nextTask = { ...task, status: "queued" as const, revision: (task.revision ?? 0) + 1, updated: "Just now" };
-    setTasks((current) => current.map((item) => item.id === task.id ? nextTask : item));
-    addActivity({ title: `${task.title} was queued for retry`, detail: "The assigned agent will start a fresh run.", kind: "decision" });
+    void sendTaskBoardCommand({ action: "retry", taskId: task.id, expectedTaskRevision: task.revision ?? 0 })
+      .then(() => addActivity({ title: `${task.title} was queued for retry`, detail: "The assigned agent will start a fresh run.", kind: "decision" }))
+      .catch(() => undefined);
   };
 
   const updateArtifact = (content: string) => {
@@ -1075,6 +1110,8 @@ export function VaultWorkspace() {
         return (
           <TasksView
             agents={agents}
+            error={taskActionError}
+            pending={taskActionPending}
             people={people}
             rooms={rooms}
             tasks={tasks}
@@ -1714,85 +1751,6 @@ function RoomAgentRunner({ agent, mentionTargets, onFailure, onMessage, onStatus
   return null;
 }
 
-function TaskAgentRunner({ agent, task, room, onStart, onComplete, onFailure }: { readonly agent: Agent; readonly task: Task; readonly room?: Room; readonly onStart: (taskId: string, revision: number) => void; readonly onComplete: (taskId: string, revision: number, result: string) => void; readonly onFailure: (taskId: string, revision: number, detail: string) => void }) {
-  const sentRevision = useRef<number | undefined>(undefined);
-  const reportedRevision = useRef<number | undefined>(undefined);
-  const claimedAttempt = useRef<number | undefined>(undefined);
-  const revision = task.revision ?? 0;
-  const route = roomAgentRoute(agent.id);
-  const eveAgent = useEveAgent({
-    agent: route,
-    ...(route === "custom" ? { headers: { "x-vault-agent-id": agent.id } } : {}),
-    onError(error) {
-      if (claimedAttempt.current === undefined) return;
-      if (reportedRevision.current === revision) return;
-      reportedRevision.current = revision;
-      void persistTaskRun(task.id, revision, claimedAttempt.current, "fail", error.message).then((accepted) => accepted && onFailure(task.id, revision, error.message)).catch(() => undefined);
-    },
-    onFinish(snapshot) {
-      const result = latestAssistantText(snapshot.data.messages);
-      if (result.length === 0 || claimedAttempt.current === undefined || reportedRevision.current === revision) return;
-      reportedRevision.current = revision;
-      void persistTaskRun(task.id, revision, claimedAttempt.current, "complete", result).then((accepted) => accepted && onComplete(task.id, revision, result)).catch(() => undefined);
-    },
-    onSessionChange(session) {
-      if (!session) return;
-      void fetch("/api/agent-sessions", {
-        body: JSON.stringify({ agentId: agent.id, eveSessionId: session.sessionId, roomId: room?.id }),
-        headers: { "Content-Type": "application/json" },
-        method: "POST",
-      }).catch(() => undefined);
-    },
-  });
-
-  useEffect(() => {
-    if (sentRevision.current === revision || eveAgent.status === "resuming") return;
-    sentRevision.current = revision;
-    void (async () => {
-      let attempt: number | undefined;
-      for (let retry = 0; retry < 6; retry += 1) {
-        const claimResponse = await fetch("/api/tasks", {
-          body: JSON.stringify({ action: "claim", taskId: task.id, taskRevision: revision, agentId: agent.id }),
-          headers: { "Content-Type": "application/json" },
-          method: "POST",
-        });
-        const claim = await claimResponse.json() as { run?: { attempt?: number }; error?: string };
-        if (claimResponse.ok && claim.run?.attempt) { attempt = claim.run.attempt; break; }
-        if (claimResponse.status === 409 && claim.error?.includes("saved task assignment") && retry < 5) {
-          await new Promise((resolve) => window.setTimeout(resolve, 500));
-          continue;
-        }
-        return;
-      }
-      if (!attempt) return;
-      claimedAttempt.current = attempt;
-      onStart(task.id, revision);
-      await eveAgent.send(buildTaskPrompt(task, agent, room), {
-        clientContext: JSON.stringify({
-          vaultAgentId: agent.id,
-          vaultAgent: agent,
-          vaultModel: getRoomModelContext(agent),
-        }),
-      });
-    })().catch((error: unknown) => {
-      const detail = error instanceof Error ? error.message : "The agent could not complete its task.";
-      if (reportedRevision.current === revision) return;
-      reportedRevision.current = revision;
-      if (claimedAttempt.current !== undefined) void persistTaskRun(task.id, revision, claimedAttempt.current, "fail", detail).then((accepted) => accepted && onFailure(task.id, revision, detail)).catch(() => undefined);
-    });
-  }, [agent, eveAgent, onFailure, onStart, room, revision, task]);
-
-  return null;
-}
-
-function persistTaskRun(taskId: string, taskRevision: number, attempt: number, action: "complete" | "fail", value: string): Promise<boolean> {
-  return fetch("/api/tasks", {
-    body: JSON.stringify({ action, taskId, taskRevision, attempt, ...(action === "complete" ? { result: value } : { error: value }) }),
-    headers: { "Content-Type": "application/json" },
-    method: "POST",
-  }).then((response) => response.ok);
-}
-
 function buildMentionTargets(agents: Agent[], people: Person[]): MentionTarget[] {
   const usedHandles = new Set<string>();
   return [
@@ -1896,18 +1854,6 @@ function buildRoomPrompt(room: Room, agent: Agent, mentionTargets: MentionTarget
   ].join("\n\n");
 }
 
-function buildTaskPrompt(task: Task, agent: Agent, room?: Room): string {
-  return [
-    `You are ${agent.name}, working as the ${agent.role} specialist in Agent Vault.`,
-    agent.context ?? agent.description,
-    `Assigned task: ${task.title}`,
-    `Instructions:
-${task.description}`,
-    room ? `This task came from the workshop room “${room.name}”. Room purpose: ${room.description}` : "This task was assigned from the Agent Vault task board.",
-    "Start working on the task now. Return a concise progress update or completed result with concrete findings, decisions, files, or next steps. Do not only describe how you would approach it.",
-  ].join("\n\n");
-}
-
 function latestAssistantText(messages: EveMessageData["messages"]): string {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
@@ -1921,7 +1867,7 @@ function latestAssistantText(messages: EveMessageData["messages"]): string {
   return "";
 }
 
-function TasksView({ agents, people, rooms, tasks, onCancelRun, onChangeStatus, onCreate, onRetryRun, onUpdateTask }: { readonly agents: Agent[]; readonly people: Person[]; readonly rooms: Room[]; readonly tasks: Task[]; readonly onCancelRun: (task: Task) => void; readonly onChangeStatus: (taskId: string, status: TaskStatus) => void; readonly onCreate: () => void; readonly onRetryRun: (task: Task) => void; readonly onUpdateTask: (task: Task) => void }) {
+function TasksView({ agents, error, pending, people, rooms, tasks, onCancelRun, onChangeStatus, onCreate, onRetryRun, onUpdateTask }: { readonly agents: Agent[]; readonly error?: string; readonly pending: boolean; readonly people: Person[]; readonly rooms: Room[]; readonly tasks: Task[]; readonly onCancelRun: (task: Task) => void; readonly onChangeStatus: (taskId: string, status: TaskStatus) => void; readonly onCreate: () => void; readonly onRetryRun: (task: Task) => void; readonly onUpdateTask: (task: Task) => Promise<void> }) {
   const [draggedTaskId, setDraggedTaskId] = useState<string>();
   const [dragOverStatus, setDragOverStatus] = useState<TaskStatus>();
   const [editingTask, setEditingTask] = useState<Task>();
@@ -1933,11 +1879,12 @@ function TasksView({ agents, people, rooms, tasks, onCancelRun, onChangeStatus, 
   ];
   return (
     <div className="space-y-6">
-      <PageIntro eyebrow="Task Board" title="Make the work legible." description="Assign work, drag cards between statuses, and surface blocked tasks before they disappear." action={<Button onClick={onCreate}><PlusIcon /> Assign task</Button>} />
-      <div className="grid gap-4 xl:grid-cols-4">
+      <PageIntro eyebrow="Task Board" title="Make the work legible." description="Assign work, drag cards between statuses, and surface blocked tasks before they disappear." action={<Button disabled={pending} onClick={onCreate}><PlusIcon /> Assign task</Button>} />
+      {error ? <p aria-live="polite" className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p> : null}
+      <div aria-busy={pending} className={cn("grid gap-4 xl:grid-cols-4", pending && "pointer-events-none opacity-60")}>
         {columns.map((column) => { const Icon = column.icon; const columnTasks = tasks.filter((task) => task.status === column.status); const isDropTarget = dragOverStatus === column.status && draggedTaskId !== undefined; return <section className={cn("min-h-96 rounded-xl border bg-white p-3 shadow-sm transition-colors", isDropTarget && "border-primary bg-primary/5")} key={column.status} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; setDragOverStatus(column.status); }} onDrop={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; const taskId = event.dataTransfer.getData("text/plain"); if (taskId) onChangeStatus(taskId, column.status); setDraggedTaskId(undefined); setDragOverStatus(undefined); }}><div className="flex items-center justify-between px-2 py-2"><div className="flex items-center gap-2"><Icon className={cn("size-4", taskTone(column.status))} /><h2 className="text-sm font-semibold">{column.label}</h2><span className="rounded-full bg-muted px-2 py-1 text-[11px] text-muted-foreground">{columnTasks.length}</span></div><Button aria-label={`More ${column.label} options`} size="icon-xs" variant="ghost"><MoreHorizontalIcon /></Button></div><div className="mt-2 space-y-3">{columnTasks.map((task) => <TaskCard agents={agents} isDragging={draggedTaskId === task.id} key={task.id} onCancelRun={onCancelRun} onChangeStatus={onChangeStatus} onDragEnd={() => { setDraggedTaskId(undefined); setDragOverStatus(undefined); }} onDragStart={(taskId) => setDraggedTaskId(taskId)} onEdit={() => setEditingTask(task)} onRetryRun={onRetryRun} people={people} room={rooms.find((room) => room.id === task.roomId)} task={task} tasks={tasks} />)}</div>{columnTasks.length === 0 ? <div className="flex min-h-28 items-center justify-center rounded-lg border border-dashed text-xs text-muted-foreground">Drop a task here</div> : null}</section>; })}
       </div>
-      <TaskEditorDialog agents={agents} onClose={() => setEditingTask(undefined)} onSave={(task) => { onUpdateTask(task); setEditingTask(undefined); }} people={people} room={editingTask ? rooms.find((room) => room.id === editingTask.roomId) : undefined} task={editingTask} tasks={tasks} />
+      <TaskEditorDialog agents={agents} onClose={() => setEditingTask(undefined)} onSave={onUpdateTask} people={people} room={editingTask ? rooms.find((room) => room.id === editingTask.roomId) : undefined} task={editingTask} tasks={tasks} />
     </div>
   );
 }
@@ -1945,9 +1892,9 @@ function TasksView({ agents, people, rooms, tasks, onCancelRun, onChangeStatus, 
 function TaskCard({ agents, isDragging, people, room, task, tasks, onCancelRun, onChangeStatus, onDragEnd, onDragStart, onEdit, onRetryRun }: { readonly agents: Agent[]; readonly isDragging: boolean; readonly people: Person[]; readonly room?: Room; readonly task: Task; readonly tasks: Task[]; readonly onCancelRun: (task: Task) => void; readonly onChangeStatus: (taskId: string, status: TaskStatus) => void; readonly onDragEnd: () => void; readonly onDragStart: (taskId: string) => void; readonly onEdit: () => void; readonly onRetryRun: (task: Task) => void }) {
   const agent = task.assigneeType === "agent" ? agents.find((item) => item.id === task.assigneeId) : undefined;
   const person = task.assigneeType === "person" ? people.find((item) => item.id === task.assigneeId) : undefined;
-  const nextStatus: TaskStatus = task.status === "queued" ? "active" : task.status === "active" ? "completed" : task.status === "blocked" ? "active" : "queued";
+  const nextStatus: TaskStatus = task.status === "queued" ? "active" : task.status === "active" ? task.assigneeType === "agent" ? "blocked" : "completed" : task.status === "blocked" ? "active" : "queued";
   const waitingFor = unmetTaskDependencies(task, tasks);
-  return <article className={cn("cursor-grab rounded-lg border bg-white p-3 shadow-xs transition-all hover:shadow-sm active:cursor-grabbing", isDragging && "scale-[.98] opacity-50")} draggable onDragEnd={onDragEnd} onDragStart={(event) => { event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", task.id); onDragStart(task.id); }}><div className="flex items-start justify-between gap-2"><button className="min-w-0 text-left text-sm font-medium leading-5 hover:text-primary" onClick={onEdit} title="Edit task" type="button">{task.title}</button><PriorityBadge priority={task.priority} /></div><p className="mt-2 line-clamp-2 text-xs leading-5 text-muted-foreground">{task.description}</p>{waitingFor.length > 0 ? <p className="mt-2 rounded-md bg-amber-50 px-2 py-1 text-[11px] text-amber-800">Waiting for {waitingFor.length} prerequisite{waitingFor.length === 1 ? "" : "s"}</p> : null}{task.result ? <p className="mt-2 line-clamp-2 rounded-md bg-emerald-50 px-2 py-1.5 text-[11px] leading-4 text-emerald-800"><span className="font-medium">Latest result:</span> {task.result}</p> : null}{room ? <p className="mt-2 truncate text-[10px] text-muted-foreground">From {room.name}</p> : null}<div className="mt-3 flex items-center justify-between gap-2"><div className="flex min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground">{agent ? <AgentAvatar agent={agent} small /> : person ? <PersonAvatar person={person} /> : <div className="flex size-7 shrink-0 items-center justify-center rounded-full border bg-muted text-xs">?</div>}<span className="truncate">{agent?.name ?? person?.name ?? "Unassigned"}</span><Badge className="shrink-0 text-[9px]" variant="outline">{task.assigneeType === "person" ? "Person" : "Agent"}</Badge></div><div className="flex items-center gap-1"><Button onClick={onEdit} size="icon-xs" variant="ghost" title="Edit task"><SquarePenIcon /></Button>{task.status === "active" ? <Button onClick={() => onCancelRun(task)} size="icon-xs" variant="ghost" title="Cancel agent run"><XIcon /></Button> : task.status === "blocked" ? <Button onClick={() => onRetryRun(task)} size="icon-xs" variant="ghost" title="Retry task"><RefreshCwIcon /></Button> : null}<Button onClick={() => onChangeStatus(task.id, nextStatus)} size="icon-xs" variant="ghost" title={`Move to ${nextStatus}`}><ChevronRightIcon /></Button></div></div></article>;
+  return <article className={cn("cursor-grab rounded-lg border bg-white p-3 shadow-xs transition-all hover:shadow-sm active:cursor-grabbing", isDragging && "scale-[.98] opacity-50")} draggable onDragEnd={onDragEnd} onDragStart={(event) => { event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", task.id); onDragStart(task.id); }}><div className="flex items-start justify-between gap-2"><button className="min-w-0 text-left text-sm font-medium leading-5 hover:text-primary" onClick={onEdit} title="Edit task" type="button">{task.title}</button><PriorityBadge priority={task.priority} /></div><p className="mt-2 line-clamp-2 text-xs leading-5 text-muted-foreground">{task.description}</p>{waitingFor.length > 0 ? <p className="mt-2 rounded-md bg-amber-50 px-2 py-1 text-[11px] text-amber-800">Waiting for {waitingFor.length} prerequisite{waitingFor.length === 1 ? "" : "s"}</p> : null}{task.result ? <p className="mt-2 line-clamp-2 rounded-md bg-emerald-50 px-2 py-1.5 text-[11px] leading-4 text-emerald-800"><span className="font-medium">Latest result:</span> {task.result}</p> : null}{room ? <p className="mt-2 truncate text-[10px] text-muted-foreground">From {room.name}</p> : null}<div className="mt-3 flex items-center justify-between gap-2"><div className="flex min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground">{agent ? <AgentAvatar agent={agent} small /> : person ? <PersonAvatar person={person} /> : <div className="flex size-7 shrink-0 items-center justify-center rounded-full border bg-muted text-xs">?</div>}<span className="truncate">{agent?.name ?? person?.name ?? "Unassigned"}</span><Badge className="shrink-0 text-[9px]" variant="outline">{task.assigneeType === "person" ? "Person" : "Agent"}</Badge></div><div className="flex items-center gap-1"><Button onClick={onEdit} size="icon-xs" variant="ghost" title="Edit task"><SquarePenIcon /></Button>{task.assigneeType === "agent" && task.status === "active" ? <Button onClick={() => onCancelRun(task)} size="icon-xs" variant="ghost" title="Cancel agent run"><XIcon /></Button> : task.assigneeType === "agent" && task.status === "blocked" ? <Button onClick={() => onRetryRun(task)} size="icon-xs" variant="ghost" title="Retry task"><RefreshCwIcon /></Button> : null}<Button onClick={() => onChangeStatus(task.id, nextStatus)} size="icon-xs" variant="ghost" title={`Move to ${nextStatus}`}><ChevronRightIcon /></Button></div></div></article>;
 }
 
 function ArtifactsView({ artifacts, selectedArtifact, selectedArtifactId, onChange, onCreate, onPublish, onSelect }: { readonly artifacts: Artifact[]; readonly selectedArtifact?: Artifact; readonly selectedArtifactId: string; readonly onChange: (content: string) => void; readonly onCreate: () => void; readonly onPublish: () => void; readonly onSelect: (artifactId: string) => void }) {
@@ -2163,23 +2110,35 @@ function RoomCreatorDialog({ open, onClose, onCreate }: { readonly open: boolean
   return <Dialog open={open} onOpenChange={(nextOpen) => !nextOpen && onClose()}><DialogContent><DialogHeader><DialogTitle>Create workshop room</DialogTitle><DialogDescription>Give a team of agents a shared goal and working context.</DialogDescription></DialogHeader><div className="space-y-4"><Field label="Room name"><Input onChange={(event) => setName(event.currentTarget.value)} placeholder="e.g. Product discovery" value={name} /></Field><Field label="Purpose"><Textarea onChange={(event) => setDescription(event.currentTarget.value)} placeholder="What should this room accomplish?" value={description} /></Field></div><DialogFooter><Button onClick={onClose} variant="outline">Cancel</Button><Button disabled={name.trim().length === 0} onClick={create}><PlusIcon /> Create room</Button></DialogFooter></DialogContent></Dialog>;
 }
 
-function TaskCreatorDialog({ open, onClose, onCreate, agents, people, room }: { readonly open: boolean; readonly onClose: () => void; readonly onCreate: (task: Task) => void; readonly agents: Agent[]; readonly people: Person[]; readonly room?: Room }) {
+function TaskCreatorDialog({ open, onClose, onCreate, agents, people, room }: { readonly open: boolean; readonly onClose: () => void; readonly onCreate: (task: Task) => Promise<void>; readonly agents: Agent[]; readonly people: Person[]; readonly room?: Room }) {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [acceptanceCriteria, setAcceptanceCriteria] = useState("");
   const [assigneeType, setAssigneeType] = useState<TaskAssigneeType>("agent");
   const [assigneeId, setAssigneeId] = useState(agents.find((agent) => agent.id !== "lead")?.id ?? agents[0]?.id ?? "");
   const [priority, setPriority] = useState<Task["priority"]>("medium");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string>();
   const assignees = assigneeType === "agent" ? agents : people;
   const chooseAssigneeType = (nextType: TaskAssigneeType) => {
     setAssigneeType(nextType);
     setAssigneeId(nextType === "agent" ? agents[0]?.id ?? "" : people[0]?.id ?? "");
   };
-  const create = () => { if (!title.trim() || !assigneeId || !acceptanceCriteria.trim()) return; onCreate({ id: `task-${Date.now()}`, title: title.trim(), description: description.trim() || "Complete the assigned work and report the result.", acceptanceCriteria: acceptanceCriteria.trim(), assigneeId, assigneeType, roomId: room?.id, status: "queued", priority, updated: "Just now", revision: 0 }); setTitle(""); setDescription(""); setAcceptanceCriteria(""); };
-  return <Dialog open={open} onOpenChange={(nextOpen) => !nextOpen && onClose()}><DialogContent><DialogHeader><DialogTitle>Assign a task</DialogTitle><DialogDescription>Give an agent or person a clear outcome and place it in the queue.</DialogDescription></DialogHeader><div className="space-y-4">{room ? <div className="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">Created from <span className="font-medium text-foreground">{room.name}</span>. The room context will be included for the assigned agent.</div> : null}<Field label="Task title"><Input onChange={(event) => setTitle(event.currentTarget.value)} placeholder="e.g. Compare local model options" value={title} /></Field><Field label="Brief / instructions"><Textarea onChange={(event) => setDescription(event.currentTarget.value)} placeholder="What does done look like?" value={description} /></Field><Field label="Acceptance criteria"><Textarea onChange={(event) => setAcceptanceCriteria(event.currentTarget.value)} placeholder="What evidence or deliverable will show this task is done?" value={acceptanceCriteria} /></Field><div className="grid gap-4 sm:grid-cols-2"><Field label="Assign to"><div className="mb-2 flex gap-2"><Button className="flex-1" onClick={() => chooseAssigneeType("agent")} size="sm" type="button" variant={assigneeType === "agent" ? "default" : "outline"}><BotIcon /> Agent</Button><Button className="flex-1" onClick={() => chooseAssigneeType("person")} size="sm" type="button" variant={assigneeType === "person" ? "default" : "outline"}><UsersIcon /> Person</Button></div>{assignees.length > 0 ? <select className="h-9 w-full rounded-md border bg-transparent px-3 text-sm" onChange={(event) => setAssigneeId(event.currentTarget.value)} value={assigneeId}>{assignees.map((assignee) => <option key={assignee.id} value={assignee.id}>{assignee.name}{"role" in assignee ? ` · ${roleLabel(assignee.role)}` : ` · ${assignee.email}`}</option>)}</select> : <p className="rounded-md border border-dashed px-3 py-2 text-xs text-muted-foreground">No people have been added yet. Add them from Workshop Rooms first.</p>}</Field><Field label="Priority"><select className="h-9 w-full rounded-md border bg-transparent px-3 text-sm" onChange={(event) => setPriority(event.currentTarget.value as Task["priority"])} value={priority}>{["low", "medium", "high"].map((value) => <option key={value} value={value}>{value.charAt(0).toUpperCase() + value.slice(1)}</option>)}</select></Field></div></div><DialogFooter><Button onClick={onClose} variant="outline">Cancel</Button><Button disabled={title.trim().length === 0 || !assigneeId || !acceptanceCriteria.trim()} onClick={create}><ClipboardListIcon /> Assign task</Button></DialogFooter></DialogContent></Dialog>;
+  const create = async () => {
+    if (!title.trim() || !assigneeId || !acceptanceCriteria.trim() || saving) return;
+    setSaving(true);
+    setError(undefined);
+    try {
+      await onCreate({ id: `task-${Date.now()}`, title: title.trim(), description: description.trim() || "Complete the assigned work and report the result.", acceptanceCriteria: acceptanceCriteria.trim(), assigneeId, assigneeType, roomId: room?.id, status: "queued", priority, updated: "Just now", revision: 0 });
+      setTitle(""); setDescription(""); setAcceptanceCriteria("");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "The task could not be assigned.");
+    } finally { setSaving(false); }
+  };
+  return <Dialog open={open} onOpenChange={(nextOpen) => !nextOpen && onClose()}><DialogContent><DialogHeader><DialogTitle>Assign a task</DialogTitle><DialogDescription>Give an agent or person a clear outcome and place it in the queue.</DialogDescription></DialogHeader><div className="space-y-4">{room ? <div className="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">Created from <span className="font-medium text-foreground">{room.name}</span>. The room context will be included for the assigned agent.</div> : null}<Field label="Task title"><Input onChange={(event) => setTitle(event.currentTarget.value)} placeholder="e.g. Compare local model options" value={title} /></Field><Field label="Brief / instructions"><Textarea onChange={(event) => setDescription(event.currentTarget.value)} placeholder="What does done look like?" value={description} /></Field><Field label="Acceptance criteria"><Textarea onChange={(event) => setAcceptanceCriteria(event.currentTarget.value)} placeholder="What evidence or deliverable will show this task is done?" value={acceptanceCriteria} /></Field><div className="grid gap-4 sm:grid-cols-2"><Field label="Assign to"><div className="mb-2 flex gap-2"><Button className="flex-1" onClick={() => chooseAssigneeType("agent")} size="sm" type="button" variant={assigneeType === "agent" ? "default" : "outline"}><BotIcon /> Agent</Button><Button className="flex-1" onClick={() => chooseAssigneeType("person")} size="sm" type="button" variant={assigneeType === "person" ? "default" : "outline"}><UsersIcon /> Person</Button></div>{assignees.length > 0 ? <select className="h-9 w-full rounded-md border bg-transparent px-3 text-sm" onChange={(event) => setAssigneeId(event.currentTarget.value)} value={assigneeId}>{assignees.map((assignee) => <option key={assignee.id} value={assignee.id}>{assignee.name}{"role" in assignee ? ` · ${roleLabel(assignee.role)}` : ` · ${assignee.email}`}</option>)}</select> : <p className="rounded-md border border-dashed px-3 py-2 text-xs text-muted-foreground">No people have been added yet. Add them from Workshop Rooms first.</p>}</Field><Field label="Priority"><select className="h-9 w-full rounded-md border bg-transparent px-3 text-sm" onChange={(event) => setPriority(event.currentTarget.value as Task["priority"])} value={priority}>{["low", "medium", "high"].map((value) => <option key={value} value={value}>{value.charAt(0).toUpperCase() + value.slice(1)}</option>)}</select></Field></div></div>{error ? <p aria-live="polite" className="text-sm text-destructive">{error}</p> : null}<DialogFooter><Button onClick={onClose} variant="outline">Cancel</Button><Button disabled={saving || title.trim().length === 0 || !assigneeId || !acceptanceCriteria.trim()} onClick={create}><ClipboardListIcon /> {saving ? "Assigning…" : "Assign task"}</Button></DialogFooter></DialogContent></Dialog>;
 }
 
-function TaskEditorDialog({ task, tasks, agents, people, room, onClose, onSave }: { readonly task?: Task; readonly tasks: Task[]; readonly agents: Agent[]; readonly people: Person[]; readonly room?: Room; readonly onClose: () => void; readonly onSave: (task: Task) => void }) {
+function TaskEditorDialog({ task, tasks, agents, people, room, onClose, onSave }: { readonly task?: Task; readonly tasks: Task[]; readonly agents: Agent[]; readonly people: Person[]; readonly room?: Room; readonly onClose: () => void; readonly onSave: (task: Task) => Promise<void> }) {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [acceptanceCriteria, setAcceptanceCriteria] = useState("");
@@ -2187,6 +2146,8 @@ function TaskEditorDialog({ task, tasks, agents, people, room, onClose, onSave }
   const [assigneeId, setAssigneeId] = useState("");
   const [priority, setPriority] = useState<Task["priority"]>("medium");
   const [dependsOn, setDependsOn] = useState<string[]>([]);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string>();
   useEffect(() => {
     if (!task) return;
     setTitle(task.title);
@@ -2203,11 +2164,18 @@ function TaskEditorDialog({ task, tasks, agents, people, room, onClose, onSave }
     setAssigneeType(nextType);
     setAssigneeId(nextType === "agent" ? agents[0]?.id ?? "" : people[0]?.id ?? "");
   };
-  const save = () => {
-    if (!title.trim() || !assigneeId) return;
-    onSave({ ...task, title: title.trim(), description: description.trim() || "Complete the assigned work and report the result.", acceptanceCriteria: acceptanceCriteria.trim() || undefined, assigneeId, assigneeType, priority, dependsOn });
+  const save = async () => {
+    if (!title.trim() || !assigneeId || saving) return;
+    setSaving(true);
+    setError(undefined);
+    try {
+      await onSave({ ...task, title: title.trim(), description: description.trim() || "Complete the assigned work and report the result.", acceptanceCriteria: acceptanceCriteria.trim() || undefined, assigneeId, assigneeType, priority, dependsOn });
+      onClose();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Task changes could not be saved.");
+    } finally { setSaving(false); }
   };
-  return <Dialog open onOpenChange={(nextOpen) => !nextOpen && onClose()}><DialogContent><DialogHeader><DialogTitle>Edit task</DialogTitle><DialogDescription>Update instructions, assignee, and prerequisites. Agent tasks will run again when ready.</DialogDescription></DialogHeader><div className="max-h-[60vh] space-y-4 overflow-y-auto">{room ? <div className="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">Room context: <span className="font-medium text-foreground">{room.name}</span></div> : null}<Field label="Task title"><Input onChange={(event) => setTitle(event.currentTarget.value)} value={title} /></Field><Field label="Instructions"><Textarea className="min-h-28" onChange={(event) => setDescription(event.currentTarget.value)} value={description} /></Field><Field label="Acceptance criteria"><Textarea onChange={(event) => setAcceptanceCriteria(event.currentTarget.value)} placeholder="Evidence or deliverable required to mark this done" value={acceptanceCriteria} /></Field><div className="grid gap-4 sm:grid-cols-2"><Field label="Assign to"><div className="mb-2 flex gap-2"><Button className="flex-1" onClick={() => chooseAssigneeType("agent")} size="sm" type="button" variant={assigneeType === "agent" ? "default" : "outline"}><BotIcon /> Agent</Button><Button className="flex-1" onClick={() => chooseAssigneeType("person")} size="sm" type="button" variant={assigneeType === "person" ? "default" : "outline"}><UsersIcon /> Person</Button></div>{assignees.length > 0 ? <select className="h-9 w-full rounded-md border bg-transparent px-3 text-sm" onChange={(event) => setAssigneeId(event.currentTarget.value)} value={assigneeId}>{assignees.map((assignee) => <option key={assignee.id} value={assignee.id}>{assignee.name}{"role" in assignee ? ` · ${roleLabel(assignee.role)}` : ` · ${assignee.email}`}</option>)}</select> : <p className="rounded-md border border-dashed px-3 py-2 text-xs text-muted-foreground">No people have been added yet. Add them from Workshop Rooms first.</p>}</Field><Field label="Priority"><select className="h-9 w-full rounded-md border bg-transparent px-3 text-sm" onChange={(event) => setPriority(event.currentTarget.value as Task["priority"])} value={priority}>{["low", "medium", "high"].map((value) => <option key={value} value={value}>{value.charAt(0).toUpperCase() + value.slice(1)}</option>)}</select></Field></div><fieldset className="space-y-2 rounded-md border p-3"><legend className="px-1 text-xs font-medium">Wait for these tasks</legend>{tasks.filter((candidate) => candidate.id !== task.id).map((candidate) => <label className="flex items-center gap-2 text-xs" key={candidate.id}><input checked={dependsOn.includes(candidate.id)} onChange={(event) => setDependsOn((current) => event.currentTarget.checked ? [...current, candidate.id] : current.filter((id) => id !== candidate.id))} type="checkbox" />{candidate.title} · {candidate.status}</label>)}{tasks.length <= 1 ? <p className="text-xs text-muted-foreground">No other tasks yet.</p> : null}</fieldset></div><DialogFooter><Button onClick={onClose} variant="outline">Cancel</Button><Button disabled={!title.trim() || !assigneeId || validateTaskDependencies(tasks.map((candidate) => candidate.id === task.id ? { ...task, dependsOn } : candidate)) !== undefined} onClick={save}><CheckCircle2Icon /> Save changes</Button></DialogFooter></DialogContent></Dialog>;
+  return <Dialog open onOpenChange={(nextOpen) => !nextOpen && onClose()}><DialogContent><DialogHeader><DialogTitle>Edit task</DialogTitle><DialogDescription>Update instructions, assignee, and prerequisites. Agent tasks will run again when ready.</DialogDescription></DialogHeader><div className="max-h-[60vh] space-y-4 overflow-y-auto">{room ? <div className="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">Room context: <span className="font-medium text-foreground">{room.name}</span></div> : null}<Field label="Task title"><Input onChange={(event) => setTitle(event.currentTarget.value)} value={title} /></Field><Field label="Instructions"><Textarea className="min-h-28" onChange={(event) => setDescription(event.currentTarget.value)} value={description} /></Field><Field label="Acceptance criteria"><Textarea onChange={(event) => setAcceptanceCriteria(event.currentTarget.value)} placeholder="Evidence or deliverable required to mark this done" value={acceptanceCriteria} /></Field><div className="grid gap-4 sm:grid-cols-2"><Field label="Assign to"><div className="mb-2 flex gap-2"><Button className="flex-1" onClick={() => chooseAssigneeType("agent")} size="sm" type="button" variant={assigneeType === "agent" ? "default" : "outline"}><BotIcon /> Agent</Button><Button className="flex-1" onClick={() => chooseAssigneeType("person")} size="sm" type="button" variant={assigneeType === "person" ? "default" : "outline"}><UsersIcon /> Person</Button></div>{assignees.length > 0 ? <select className="h-9 w-full rounded-md border bg-transparent px-3 text-sm" onChange={(event) => setAssigneeId(event.currentTarget.value)} value={assigneeId}>{assignees.map((assignee) => <option key={assignee.id} value={assignee.id}>{assignee.name}{"role" in assignee ? ` · ${roleLabel(assignee.role)}` : ` · ${assignee.email}`}</option>)}</select> : <p className="rounded-md border border-dashed px-3 py-2 text-xs text-muted-foreground">No people have been added yet. Add them from Workshop Rooms first.</p>}</Field><Field label="Priority"><select className="h-9 w-full rounded-md border bg-transparent px-3 text-sm" onChange={(event) => setPriority(event.currentTarget.value as Task["priority"])} value={priority}>{["low", "medium", "high"].map((value) => <option key={value} value={value}>{value.charAt(0).toUpperCase() + value.slice(1)}</option>)}</select></Field></div><fieldset className="space-y-2 rounded-md border p-3"><legend className="px-1 text-xs font-medium">Wait for these tasks</legend>{tasks.filter((candidate) => candidate.id !== task.id).map((candidate) => <label className="flex items-center gap-2 text-xs" key={candidate.id}><input checked={dependsOn.includes(candidate.id)} onChange={(event) => setDependsOn((current) => event.currentTarget.checked ? [...current, candidate.id] : current.filter((id) => id !== candidate.id))} type="checkbox" />{candidate.title} · {candidate.status}</label>)}{tasks.length <= 1 ? <p className="text-xs text-muted-foreground">No other tasks yet.</p> : null}</fieldset></div>{error ? <p aria-live="polite" className="text-sm text-destructive">{error}</p> : null}<DialogFooter><Button onClick={onClose} variant="outline">Cancel</Button><Button disabled={saving || !title.trim() || !assigneeId || validateTaskDependencies(tasks.map((candidate) => candidate.id === task.id ? { ...task, dependsOn } : candidate)) !== undefined} onClick={save}><CheckCircle2Icon /> {saving ? "Saving…" : "Save changes"}</Button></DialogFooter></DialogContent></Dialog>;
 }
 
 function ChoiceGroup({ label, values, selected, onToggle }: { readonly label: string; readonly values: string[]; readonly selected: string[]; readonly onToggle: (value: string) => void }) { return <div><p className="mb-2 text-xs font-medium">{label}</p><div className="grid gap-2">{values.map((value) => <label className="flex cursor-pointer items-center gap-2 rounded-md border px-3 py-2 text-xs hover:bg-accent" key={value}><input checked={selected.includes(value)} onChange={() => onToggle(value)} type="checkbox" />{value}</label>)}</div></div>; }

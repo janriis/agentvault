@@ -6,8 +6,8 @@ import test from "node:test";
 
 const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "agent-vault-task-test-"));
 process.env.AGENT_VAULT_DATA_DIR = dataDirectory;
-const { TaskClaimError, attachTaskRunSession, cancelTaskRun, claimTaskRun, finishTaskRun, getVaultSettings, getVaultState, heartbeatTaskRun, listTaskRuns, replaceTaskRuns, restoreVaultStateWithRuns, saveVaultState } = await import("../agent/lib/vault-database.ts");
-const { findRunnableJobs, runWorkerJob } = await import("../agent/lib/task-orchestration.ts");
+const { TaskClaimError, attachTaskRunSession, cancelTaskRun, claimTaskRun, executeTaskBoardCommand, finishTaskRun, getVaultSettings, getVaultState, heartbeatTaskRun, listTaskRuns, replaceTaskRuns, restoreVaultStateWithRuns, saveVaultState } = await import("../agent/lib/vault-database.ts");
+const { classifyTaskSessionEvents, findRunnableJobs, runWorkerJob, taskSessionExpired } = await import("../agent/lib/task-orchestration.ts");
 
 const state = (tasks) => ({ agents: [], people: [], rooms: [], tasks, activity: [] });
 const task = (id, status = "queued", dependsOn = []) => ({ id, title: id, description: id, assigneeId: "researcher", assigneeType: "agent", status, revision: 0, dependsOn });
@@ -85,6 +85,62 @@ test("invalid restore leaves both vault state and run ledger unchanged", () => {
   assert.throws(() => restoreVaultStateWithRuns(state([task("projection-task")]), [runs[0], runs[0]]), /UNIQUE/);
   assert.equal(getVaultState().revision, before.revision);
   assert.deepEqual(listTaskRuns(), runs);
+});
+
+test("task commands are atomic, revision checked, and idempotent", () => {
+  const newTask = { ...task("command-task"), acceptanceCriteria: "A verified report", priority: "medium", updated: "Just now" };
+  const command = { action: "create", task: newTask };
+  const first = executeTaskBoardCommand("command-create-0001", command);
+  assert.equal(first.replayed, false);
+  const again = executeTaskBoardCommand("command-create-0001", command);
+  assert.equal(again.replayed, true);
+  assert.equal(again.record.revision, first.record.revision);
+  assert.equal(getVaultState().state.tasks.filter((item) => item.id === newTask.id).length, 1);
+  assert.throws(() => executeTaskBoardCommand("command-create-0001", { ...command, task: { ...newTask, title: "Different" } }), /already used/);
+  const move = executeTaskBoardCommand("command-move-0001", { action: "move", taskId: newTask.id, target: "blocked", expectedTaskRevision: 0 });
+  assert.equal(move.task.status, "blocked");
+  assert.throws(() => executeTaskBoardCommand("command-move-0002", { action: "move", taskId: newTask.id, target: "queued", expectedTaskRevision: 99 }), /changed in another session/);
+  const retry = executeTaskBoardCommand("command-retry-0001", { action: "retry", taskId: newTask.id, expectedTaskRevision: 0 });
+  assert.equal(retry.task.status, "queued");
+  assert.equal(retry.task.revision, 1);
+});
+
+test("a known EVE session is inspected immediately after worker restart", () => {
+  const agent = { id: "researcher", name: "Researcher", role: "researcher", description: "Research", model: "ChatGPT subscription" };
+  saveVaultState({ ...state([task("recover-task")]), agents: [agent] });
+  const run = claimTaskRun("recover-task", 0, "researcher");
+  attachTaskRunSession("recover-task", 0, run.attempt, "wrun_recover-test");
+  const jobs = findRunnableJobs();
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].previousRun?.eveSessionId, "wrun_recover-test");
+  assert.equal(heartbeatTaskRun("recover-task", 0, run.attempt), true);
+  assert.throws(() => claimTaskRun("recover-task", 0, "researcher"), TaskClaimError);
+});
+
+test("resumed EVE sessions distinguish pending, completed, and failed turns", () => {
+  assert.deepEqual(classifyTaskSessionEvents([{ type: "turn.started" }]), { status: "pending" });
+  assert.deepEqual(classifyTaskSessionEvents([{ type: "message.completed", data: { message: "Done" } }, { type: "turn.completed" }]), { status: "completed", result: "Done" });
+  assert.equal(classifyTaskSessionEvents([{ type: "turn.completed" }]).status, "failed");
+  assert.equal(classifyTaskSessionEvents([{ type: "turn.cancelled" }]).status, "failed");
+});
+
+test("a resumed pending session expires at the configured task timeout", () => {
+  const startedAt = "2026-09-15T00:00:00.000Z";
+  const run = { taskId: "timeout", taskRevision: 0, agentId: "researcher", status: "active", attempt: 1, startedAt, updatedAt: startedAt };
+  assert.equal(taskSessionExpired(run, 30, Date.parse(startedAt) + 29 * 60_000), false);
+  assert.equal(taskSessionExpired(run, 30, Date.parse(startedAt) + 30 * 60_000), true);
+});
+
+test("vault restore invalidates old task command keys", () => {
+  saveVaultState(state([{ ...task("restore-task"), revision: 1 }]));
+  const before = getVaultState();
+  const command = { action: "move", taskId: "restore-task", target: "blocked", expectedTaskRevision: 1 };
+  const first = executeTaskBoardCommand("restore-move-0001", command);
+  assert.equal(first.replayed, false);
+  restoreVaultStateWithRuns(before.state, listTaskRuns());
+  const after = executeTaskBoardCommand("restore-move-0001", command);
+  assert.equal(after.replayed, false);
+  assert.equal(after.task.status, "blocked");
 });
 
 

@@ -56,7 +56,7 @@ export function findRunnableJobs(now = Date.now()): WorkerJob[] {
     const run = runs.get(task.id);
     if (run && run.taskRevision === (task.revision ?? 0)) {
       if (["completed", "blocked", "cancelled"].includes(run.status)) return [];
-      if (run.status === "active" && now - Date.parse(run.updatedAt) < settings.taskTimeoutMinutes * 60_000) return [];
+      if (run.status === "active" && !run.eveSessionId && now - Date.parse(run.updatedAt) < settings.taskTimeoutMinutes * 60_000) return [];
       if (run.status === "failed" && (run.attempt >= settings.maxTaskAttempts || now - Date.parse(run.updatedAt) < 30_000)) return [];
     }
     return [{ task, agent, room: rooms.find((candidate) => candidate.id === task.roomId), ...(run?.status === "active" && run.taskRevision === (task.revision ?? 0) ? { previousRun: run } : {}) }];
@@ -82,6 +82,17 @@ export function buildWorkerTaskPrompt({ task, agent, room }: WorkerJob): string 
 export function workerModelContext(agent: VaultAgent): { provider: "chatgpt" } | { provider: "ollama"; baseUrl: string; model: string } {
   if (agent.model.startsWith("Ollama · ")) return { provider: "ollama", baseUrl: getVaultSettings().ollamaHost, model: agent.model.slice("Ollama · ".length) };
   return { provider: "chatgpt" };
+}
+
+export function classifyTaskSessionEvents(events: ReadonlyArray<{ type: string; data?: { message?: string | null; finishReason?: string } }>): { status: "pending" } | { status: "completed"; result: string } | { status: "failed"; error: string } {
+  if (events.some((event) => event.type === "session.failed" || event.type === "turn.failed" || event.type === "turn.cancelled")) return { status: "failed", error: "The resumed EVE session failed or was cancelled." };
+  if (!events.some((event) => event.type === "turn.completed" || event.type === "session.completed")) return { status: "pending" };
+  const message = [...events].reverse().find((event) => event.type === "message.completed" && event.data?.finishReason !== "tool-calls")?.data?.message?.trim();
+  return message ? { status: "completed", result: message } : { status: "failed", error: "The resumed EVE session returned no result." };
+}
+
+export function taskSessionExpired(run: TaskRunRecord, timeoutMinutes: number, now = Date.now()): boolean {
+  return now - Date.parse(run.startedAt) >= timeoutMinutes * 60_000;
 }
 
 export async function runWorkerJob(job: WorkerJob, execute: (job: WorkerJob, run: TaskRunRecord) => Promise<string>): Promise<TaskRunRecord | undefined> {

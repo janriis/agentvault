@@ -97,7 +97,7 @@ Implementation record:
 
 ### Phase 2 — Reliable orchestration engine
 
-Status: **In progress — task-run ledger and board projection slices implemented 2026-09-15**
+Status: **Complete — 2026-09-15**
 
 - [x] Add a durable task-run ledger and connect assigned agent runners to it.
 - [x] Reclaim stale active runs using the persisted task timeout policy.
@@ -105,12 +105,12 @@ Status: **In progress — task-run ledger and board projection slices implemente
 - [x] Add explicit cancel and retry controls for agent-owned tasks.
 - [x] Add prerequisite graphs and prevent claims until they are complete.
 - [x] Fence task results to the active attempt and saved task revision.
-- [ ] Define and enforce durable task state transitions across all board controls.
+- [x] Define and enforce durable task state transitions across all board controls.
 - [x] Record explicit acceptance criteria when tasks are created or edited.
-- [ ] Add task dependencies, idempotency keys, retries, and cancellation.
+- [x] Add task dependencies, idempotency keys, retries, and cancellation.
 - [x] Add a local persistent worker/runner for queued agent tasks.
-- [ ] Detect stalled runs and resume interrupted sessions.
-- [ ] Make the Task Board a projection of orchestration state.
+- [x] Detect stalled runs and resume interrupted sessions.
+- [x] Make the Task Board a projection of orchestration state.
 
 Implementation record:
 
@@ -183,6 +183,28 @@ Implementation record:
 24. Made vault-state and task-run replacement one SQLite transaction during
     import. Invalid task graphs and duplicate run records fail before either
     durable record is changed.
+25. Added transactional Task Board commands for create, edit, move, and retry,
+    each with a saved idempotency key and task-revision check. Agent card
+    completion requires a matching completed ledger run; editing active work
+    fences its attempt and queues a new revision.
+26. Routed room-generated tasks and visible board controls through the same
+    command endpoint. Errors remain visible in the editor, and a conflicting
+    browser session cannot overwrite task definitions through generic state
+    saves. Removed the unused browser task runner.
+27. Fixed repeated unchanged-state writes from the browser. In an isolated
+    production UI check, the vault revision stayed unchanged during idle time;
+    a stale task edit displayed a conflict and kept its editor open.
+28. Recovery inspects saved EVE session IDs immediately after worker restart.
+    Pending turns are not duplicated, while failed, cancelled, completed, and
+    timed-out turns settle their attempt. Both live and resumed sessions use
+    the configured timeout policy.
+29. Vault restore clears command replay keys transactionally so an old response
+    cannot be replayed against imported data.
+30. Verification: 22 unit/SQLite checks, TypeScript, and a production build
+    passed. Isolated API/UI checks covered a human-card move, idempotent replay,
+    rejection of manual agent completion and task-definition tampering, and
+    visible cross-session edit conflict. The production build retains the
+    existing dynamic-workspace tracing warnings.
 25. Verification: thirteen focused unit/SQLite checks, TypeScript, and a fresh
     production build passed. The isolated version 1 and version 2 API restore
     flow passed again with the transactional implementation, and the temporary
