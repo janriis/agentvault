@@ -55,6 +55,7 @@ import { ThemeSwitcher } from "./theme-provider";
 import { unmetTaskDependencies, validateTaskDependencies } from "@/agent/lib/task-dependencies";
 import { projectTaskRuns, type ProjectableRun } from "@/agent/lib/task-projection";
 import type { TaskBoardCommand } from "@/agent/lib/task-commands";
+import { mentionedRoomAgents, parseRoomAssignments, removeRoomAssignments, validRoomAssignments } from "@/agent/lib/room-assignments";
 
 type Section = "overview" | "library" | "rooms" | "tasks" | "artifacts" | "activity" | "settings";
 type AgentStatus = "idle" | "working" | "paused" | "blocked";
@@ -112,6 +113,8 @@ interface Room {
 interface RoomTurn {
   id: string;
   content: string;
+  author?: string;
+  hop?: number;
 }
 
 interface MentionTarget {
@@ -1028,20 +1031,52 @@ export function VaultWorkspace() {
   const appendRoomAgentMessage = (roomId: string, agentId: string, content: string) => {
     const agent = agents.find((item) => item.id === agentId);
     if (!agent || content.trim().length === 0) return;
+    const room = rooms.find((item) => item.id === roomId);
+    const latestHumanRequest = room?.messages.findLast((item) => item.author === "You")?.content ?? "";
+    const assigningLead = agentId === "lead" && /\b(?:assign|delegate|reassign)\b/iu.test(latestHumanRequest) && /\b(?:tasks?|cards?|work)\b/iu.test(latestHumanRequest);
+    const visibleContent = agentId === "lead" ? removeRoomAssignments(content) : content.trim();
     const message: RoomMessage = {
       id: `message-${Date.now()}-${agentId}`,
       author: agent.name,
       role: agent.role,
-      content: content.trim(),
+      content: visibleContent || "I prepared task assignments for this room.",
       time: "Just now",
     };
     setRooms((current) =>
       current.map((room) => (room.id === roomId ? { ...room, messages: [...room.messages, message] } : room)),
     );
-    createTasksFromRoom(roomId, message);
+    if (agentId === "lead" && content.includes("<task-assignments>")) {
+      const assignments = parseRoomAssignments(content);
+      const roomAgents = room?.agentIds.map((id) => agents.find((item) => item.id === id)).filter((item): item is Agent => item !== undefined) ?? [];
+      const roomPeople = (room?.personIds ?? []).map((id) => people.find((item) => item.id === id)).filter((item): item is Person => item !== undefined);
+      const addressed = mentionedRoomAgents(latestHumanRequest, buildMentionTargets(roomAgents, roomPeople));
+      const allowed = room && /\b(?:assign|delegate|reassign)\b/iu.test(latestHumanRequest) && /\b(?:tasks?|cards?|work)\b/iu.test(latestHumanRequest) && (addressed.length === 0 || addressed.includes("lead"));
+      const eligible = new Set(room?.agentIds.filter((id) => agents.some((item) => item.id === id && item.status !== "paused" && item.status !== "blocked")) ?? []);
+      if (!allowed || !validRoomAssignments(assignments, roomId, tasks, eligible)) {
+        addActivity({ title: "Lead task assignment was not saved", detail: "The response did not contain valid queued room tasks and available room agents.", kind: "failure", agent: agent.name });
+      } else {
+        void (async () => {
+          let changed = 0;
+          for (const { taskId, assigneeId } of assignments) {
+            const task = tasks.find((item) => item.id === taskId)!;
+            if (task.assigneeId === assigneeId && task.assigneeType === "agent") continue;
+            try {
+              await sendTaskBoardCommand({ action: "edit", task: { ...task, assigneeId, assigneeType: "agent" }, expectedTaskRevision: task.revision ?? 0 });
+              changed += 1;
+            } catch (error) {
+              addActivity({ title: "Lead task assignment could not be saved", detail: error instanceof Error ? error.message : task.title, kind: "failure", agent: agent.name });
+              return;
+            }
+          }
+          addActivity({ title: `Lead reviewed ${assignments.length} room task${assignments.length === 1 ? "" : "s"}`, detail: `${changed} assignment${changed === 1 ? "" : "s"} changed on the Task Board.`, kind: "decision", agent: agent.name });
+        })();
+      }
+    } else if (!assigningLead) {
+      createTasksFromRoom(roomId, message);
+    }
     addActivity({
       title: `${agent.name} replied in ${rooms.find((room) => room.id === roomId)?.name ?? "the room"}`,
-      detail: content.trim(),
+      detail: visibleContent,
       kind: "progress",
       agent: agent.name,
     });
@@ -1125,6 +1160,7 @@ export function VaultWorkspace() {
             agents={agents}
             people={people}
             rooms={rooms}
+            tasks={tasks}
             selectedRoom={selectedRoom}
             selectedRoomId={selectedRoomId}
             onCreate={() => setShowRoomCreator(true)}
@@ -1606,6 +1642,7 @@ function RoomsView({
   agents,
   people,
   rooms,
+  tasks,
   selectedRoom,
   selectedRoomId,
   onCreate,
@@ -1622,6 +1659,7 @@ function RoomsView({
   readonly agents: Agent[];
   readonly people: Person[];
   readonly rooms: Room[];
+  readonly tasks: Task[];
   readonly selectedRoom?: Room;
   readonly selectedRoomId: string;
   readonly onCreate: () => void;
@@ -1652,13 +1690,13 @@ function RoomsView({
           </div>
           <button className="mt-3 flex w-full items-center gap-2 rounded-lg border border-dashed px-3 py-2.5 text-xs text-muted-foreground hover:bg-accent" onClick={onCreate} type="button"><PlusIcon className="size-3.5" />Create workshop room</button>
         </div>
-        {selectedRoom ? <RoomPanel agents={agents} people={people} onAgentFailure={onAgentFailure} onAgentMessage={onAgentMessage} onCreateTask={onCreateTask} onCreateTasksFromRoom={onCreateTasksFromRoom} onDeleteRoom={onDeleteRoom} onSend={onSend} onUpdateMembers={onUpdateMembers} onUpdateRoles={onUpdateRoles} room={selectedRoom} /> : <EmptyState icon={UsersIcon} title="Create a workshop room" detail="Bring specialists together around a shared goal." />}
+        {selectedRoom ? <RoomPanel agents={agents} people={people} tasks={tasks.filter((task) => task.roomId === selectedRoom.id)} onAgentFailure={onAgentFailure} onAgentMessage={onAgentMessage} onCreateTask={onCreateTask} onCreateTasksFromRoom={onCreateTasksFromRoom} onDeleteRoom={onDeleteRoom} onSend={onSend} onUpdateMembers={onUpdateMembers} onUpdateRoles={onUpdateRoles} room={selectedRoom} /> : <EmptyState icon={UsersIcon} title="Create a workshop room" detail="Bring specialists together around a shared goal." />}
       </div>
     </div>
   );
 }
 
-function RoomPanel({ agents, people, room, onSend, onAgentFailure, onAgentMessage, onCreateTask, onCreateTasksFromRoom, onDeleteRoom, onUpdateMembers, onUpdateRoles }: { readonly agents: Agent[]; readonly people: Person[]; readonly room: Room; readonly onSend: (content: string) => void; readonly onAgentFailure: (roomId: string, agentId: string, detail: string) => void; readonly onAgentMessage: (roomId: string, agentId: string, content: string) => void; readonly onCreateTask: () => void; readonly onCreateTasksFromRoom: (roomId: string) => void; readonly onDeleteRoom: (roomId: string) => void; readonly onUpdateMembers: (roomId: string, agentIds: string[], personIds: string[], invitedPeople: Person[]) => void; readonly onUpdateRoles: (roomId: string, roomRoles: Record<string, string>) => void }) {
+function RoomPanel({ agents, people, room, tasks, onSend, onAgentFailure, onAgentMessage, onCreateTask, onCreateTasksFromRoom, onDeleteRoom, onUpdateMembers, onUpdateRoles }: { readonly agents: Agent[]; readonly people: Person[]; readonly room: Room; readonly tasks: Task[]; readonly onSend: (content: string) => void; readonly onAgentFailure: (roomId: string, agentId: string, detail: string) => void; readonly onAgentMessage: (roomId: string, agentId: string, content: string) => void; readonly onCreateTask: () => void; readonly onCreateTasksFromRoom: (roomId: string) => void; readonly onDeleteRoom: (roomId: string) => void; readonly onUpdateMembers: (roomId: string, agentIds: string[], personIds: string[], invitedPeople: Person[]) => void; readonly onUpdateRoles: (roomId: string, roomRoles: Record<string, string>) => void }) {
   const [draft, setDraft] = useState("");
   const [showRoles, setShowRoles] = useState(false);
   const [showMembers, setShowMembers] = useState(false);
@@ -1674,11 +1712,17 @@ function RoomPanel({ agents, people, room, onSend, onAgentFailure, onAgentMessag
     ? []
     : mentionTargets.filter((target) => target.handle.includes(mentionContext.query.toLowerCase()) || target.name.toLowerCase().includes(mentionContext.query.toLowerCase()));
   const activeParticipants = participants.filter((agent) => agent.status !== "paused" && agent.status !== "blocked");
+  const addressedAgentIds = turn ? mentionedRoomAgents(turn.content, mentionTargets) : [];
+  const respondingParticipants = addressedAgentIds.length > 0 ? activeParticipants.filter((agent) => addressedAgentIds.includes(agent.id)) : activeParticipants;
+  const lastHumanIndex = room.messages.findLastIndex((message) => message.author === "You");
+  const lastHumanMessage = room.messages[lastHumanIndex];
+  const lastMentionedIds = lastHumanMessage ? mentionedRoomAgents(lastHumanMessage.content, mentionTargets) : [];
+  const unansweredMention = lastHumanMessage && lastMentionedIds.length > 0 && !room.messages.slice(lastHumanIndex + 1).some((message) => lastMentionedIds.some((id) => agents.find((agent) => agent.id === id)?.name === message.author));
   const submit = () => {
     const content = draft.trim();
     if (content.length === 0) return;
     onSend(content);
-    setTurn({ id: `room-turn-${Date.now()}`, content });
+    setTurn({ id: `room-turn-${Date.now()}`, content, author: "You", hop: 0 });
     setDraft("");
     setMentionContext(undefined);
   };
@@ -1693,7 +1737,7 @@ function RoomPanel({ agents, people, room, onSend, onAgentFailure, onAgentMessag
     <div className="flex h-full min-h-0 min-w-0 flex-col">
       <div className="flex flex-col justify-between gap-3 border-b px-5 py-4 sm:flex-row sm:items-center">
         <div className="min-w-0"><div className="flex items-center gap-2"><span className="size-2 rounded-full bg-emerald-500" /><h2 className="truncate font-semibold">{room.name}</h2></div><p className="mt-1 truncate text-xs text-muted-foreground">{room.description}</p></div>
-        <div className="flex items-center gap-3"><div className="flex -space-x-2">{participants.map((agent) => <AgentAvatar agent={agent} key={agent.id} small />)}{roomPeople.map((person) => <PersonAvatar person={person} key={person.id} />)}<button aria-label="Manage room members" className="flex size-7 items-center justify-center rounded-full border-2 border-card bg-muted text-muted-foreground hover:bg-accent" onClick={() => setShowMembers(true)} type="button"><PlusIcon className="size-3" /></button></div><Button onClick={onCreateTask} size="sm" variant="outline"><ClipboardListIcon />Task</Button><Button onClick={() => onCreateTasksFromRoom(room.id)} size="sm" variant="outline" title="Extract task cards from this room"><SparklesIcon />Extract tasks</Button><Button onClick={() => setShowTranscript(true)} size="sm" variant="outline"><FileTextIcon />Transcript</Button><Button onClick={() => setShowMembers(true)} size="sm" variant="outline"><PlusIcon />Members</Button><Button onClick={() => setShowRoles((current) => !current)} size="sm" variant="outline"><Settings2Icon />Roles</Button><Button aria-label={`Delete ${room.name}`} onClick={() => onDeleteRoom(room.id)} size="icon-sm" title="Delete room" variant="ghost"><Trash2Icon /></Button></div>
+        <div className="flex items-center gap-3"><div className="flex -space-x-2">{participants.map((agent) => <AgentAvatar agent={agent} key={agent.id} small />)}{roomPeople.map((person) => <PersonAvatar person={person} key={person.id} />)}<button aria-label="Manage room members" className="flex size-7 items-center justify-center rounded-full border-2 border-card bg-muted text-muted-foreground hover:bg-accent" onClick={() => setShowMembers(true)} type="button"><PlusIcon className="size-3" /></button></div>{unansweredMention ? <Button disabled={lastMentionedIds.some((id) => busyAgentIds.includes(id))} onClick={() => setTurn({ id: `room-retry-${Date.now()}`, content: lastHumanMessage.content, author: "You", hop: 0 })} size="sm" variant="outline"><RefreshCwIcon />Retry mention</Button> : null}<Button onClick={onCreateTask} size="sm" variant="outline"><ClipboardListIcon />Task</Button><Button onClick={() => onCreateTasksFromRoom(room.id)} size="sm" variant="outline" title="Extract task cards from this room"><SparklesIcon />Extract tasks</Button><Button onClick={() => setShowTranscript(true)} size="sm" variant="outline"><FileTextIcon />Transcript</Button><Button onClick={() => setShowMembers(true)} size="sm" variant="outline"><PlusIcon />Members</Button><Button onClick={() => setShowRoles((current) => !current)} size="sm" variant="outline"><Settings2Icon />Roles</Button><Button aria-label={`Delete ${room.name}`} onClick={() => onDeleteRoom(room.id)} size="icon-sm" title="Delete room" variant="ghost"><Trash2Icon /></Button></div>
       </div>
       <RoomMembersDialog agents={agents} people={people} onClose={() => setShowMembers(false)} onSave={(agentIds, personIds, invitedPeople) => { onUpdateMembers(room.id, agentIds, personIds, invitedPeople); setShowMembers(false); }} open={showMembers} selectedAgentIds={room.agentIds} selectedPersonIds={room.personIds ?? EMPTY_PERSON_IDS} />
       <RoomTranscriptDialog agents={participants} onClose={() => setShowTranscript(false)} open={showTranscript} people={roomPeople} room={room} />
@@ -1704,7 +1748,7 @@ function RoomPanel({ agents, people, room, onSend, onAgentFailure, onAgentMessag
       <div className="border-t bg-card p-4">
         <div className="rounded-lg border bg-muted/20 p-2 focus-within:border-ring"><Textarea ref={textareaRef} className="min-h-16 resize-none border-0 bg-transparent p-2 shadow-none focus-visible:ring-0" onChange={(event) => { const value = event.currentTarget.value; setDraft(value); setMentionContext(findMentionContext(value, event.currentTarget.selectionStart)); }} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter") { event.preventDefault(); submit(); return; } if (mentionSuggestions.length > 0 && (event.key === "Enter" || event.key === "Tab")) { event.preventDefault(); insertMention(draft, mentionContext, mentionSuggestions[0], setDraft, setMentionContext, textareaRef); return; } if (event.key === "Escape" && mentionContext !== undefined) { event.preventDefault(); setMentionContext(undefined); return; } }} placeholder="Message the room… Use @ to mention someone" value={draft} />{mentionSuggestions.length > 0 ? <div className="mt-1 border-t px-1 pt-1"><p className="px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Mention someone</p><div className="grid gap-1 sm:grid-cols-2">{mentionSuggestions.slice(0, 8).map((target) => <button className="flex items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" key={`${target.kind}:${target.id}`} onMouseDown={(event) => event.preventDefault()} onClick={() => insertMention(draft, mentionContext, target, setDraft, setMentionContext, textareaRef)} type="button"><span className={cn("flex size-6 items-center justify-center rounded-full text-[9px] font-semibold text-white", target.kind === "agent" ? avatarColor(target.role) : "bg-indigo-600")}>{initials(target.name)}</span><span className="min-w-0"><span className="block truncate text-xs font-medium">@{target.handle}</span><span className="block truncate text-[10px] text-muted-foreground">{target.name}{target.role ? ` · ${roleLabel(target.role)}` : " · Person"}</span></span></button>)}</div></div> : null}<div className="flex items-center justify-between px-2 pt-1"><span className="text-[11px] text-muted-foreground">{busyAgentIds.length > 0 ? `${busyAgentIds.length} agent${busyAgentIds.length === 1 ? " is" : "s are"} thinking…` : "⌘ Enter to send · @ mentions supported"}</span><Button disabled={draft.trim().length === 0} onClick={submit} size="sm">Send <ArrowRightIcon /></Button></div></div>
       </div>
-      {activeParticipants.map((agent) => <RoomAgentRunner agent={agent} key={`${room.id}:${agent.id}`} mentionTargets={mentionTargets} onFailure={(detail) => onAgentFailure(room.id, agent.id, detail)} onMessage={(content) => onAgentMessage(room.id, agent.id, content)} onStatus={(busy) => setAgentBusy(agent.id, busy)} room={room} turn={turn} />)}
+      {activeParticipants.map((agent) => <RoomAgentRunner agent={agent} key={`${room.id}:${agent.id}`} mentionTargets={mentionTargets} tasks={tasks} availableAgents={activeParticipants} onFailure={(detail) => onAgentFailure(room.id, agent.id, detail)} onMessage={(content, repliedTo) => { onAgentMessage(room.id, agent.id, content); if ((repliedTo.hop ?? 0) < 1 && mentionedRoomAgents(content, mentionTargets).some((id) => id !== agent.id)) setTurn({ id: `room-turn-${Date.now()}-${agent.id}`, content, author: agent.name, hop: 1 }); }} onStatus={(busy) => setAgentBusy(agent.id, busy)} room={room} turn={respondingParticipants.includes(agent) ? turn : undefined} />)}
     </div>
   );
 }
@@ -1738,24 +1782,28 @@ function RoomTranscriptDialog({ agents, people, room, open, onClose }: { readonl
   return <Dialog open={open} onOpenChange={(nextOpen) => !nextOpen && onClose()}><DialogContent className="max-h-[90vh] max-w-3xl"><DialogHeader><DialogTitle>Transcript · {room.name}</DialogTitle><DialogDescription>Everything currently recorded in this room, including agent replies and your messages.</DialogDescription></DialogHeader><div aria-label="Room transcript" className="max-h-[60vh] overflow-y-auto rounded-md border bg-muted/10 p-4"><pre className="whitespace-pre-wrap font-mono text-xs leading-5">{transcript}</pre></div><DialogFooter><Button onClick={onClose} variant="outline">Close</Button><Button onClick={copyTranscript} variant="outline"><CopyIcon />{copied ? "Copied" : "Copy transcript"}</Button><Button onClick={downloadTranscript}><FileDownIcon />Download Markdown</Button></DialogFooter></DialogContent></Dialog>;
 }
 
-function RoomAgentRunner({ agent, mentionTargets, onFailure, onMessage, onStatus, room, turn }: { readonly agent: Agent; readonly mentionTargets: MentionTarget[]; readonly onFailure: (detail: string) => void; readonly onMessage: (content: string) => void; readonly onStatus: (busy: boolean) => void; readonly room: Room; readonly turn?: RoomTurn }) {
+function RoomAgentRunner({ agent, availableAgents, mentionTargets, tasks, onFailure, onMessage, onStatus, room, turn }: { readonly agent: Agent; readonly availableAgents: Agent[]; readonly mentionTargets: MentionTarget[]; readonly tasks: Task[]; readonly onFailure: (detail: string) => void; readonly onMessage: (content: string, repliedTo: RoomTurn) => void; readonly onStatus: (busy: boolean) => void; readonly room: Room; readonly turn?: RoomTurn }) {
   const sentTurnId = useRef<string | undefined>(undefined);
   const reportedTurnId = useRef<string | undefined>(undefined);
+  const inFlightTurn = useRef<RoomTurn | undefined>(undefined);
   const route = roomAgentRoute(agent.id);
   const eveAgent = useEveAgent({
     agent: route,
     ...(route === "custom" ? { headers: { "x-vault-agent-id": agent.id } } : {}),
     onError(error) {
+      inFlightTurn.current = undefined;
       onStatus(false);
       onFailure(error.message);
     },
     onFinish(snapshot) {
+      const completedTurn = inFlightTurn.current;
+      inFlightTurn.current = undefined;
       onStatus(false);
-      if (!turn || reportedTurnId.current === turn.id) return;
+      if (!completedTurn || reportedTurnId.current === completedTurn.id) return;
       const response = latestAssistantText(snapshot.data.messages);
       if (response.length === 0) return;
-      reportedTurnId.current = turn.id;
-      onMessage(response);
+      reportedTurnId.current = completedTurn.id;
+      onMessage(response, completedTurn);
     },
     onSessionChange(session) {
       if (!session) return;
@@ -1768,16 +1816,18 @@ function RoomAgentRunner({ agent, mentionTargets, onFailure, onMessage, onStatus
   });
 
   useEffect(() => {
-    if (!turn || sentTurnId.current === turn.id || eveAgent.status === "resuming") return;
+    if (!turn || sentTurnId.current === turn.id || inFlightTurn.current || eveAgent.status === "resuming") return;
     sentTurnId.current = turn.id;
+    inFlightTurn.current = turn;
     onStatus(true);
-    void eveAgent.send(buildRoomPrompt(room, agent, mentionTargets, turn), {
+    void eveAgent.send(buildRoomPrompt(room, agent, mentionTargets, tasks, availableAgents, turn), {
       clientContext: JSON.stringify({
         vaultAgentId: agent.id,
         vaultAgent: agent,
         vaultModel: getRoomModelContext(agent),
       }),
     }).catch((error: unknown) => {
+      inFlightTurn.current = undefined;
       onStatus(false);
       onFailure(error instanceof Error ? error.message : "The agent could not complete its room turn.");
     });
@@ -1871,7 +1921,7 @@ function getRoomModelContext(agent: Agent): { provider: "chatgpt" } | { provider
   return { provider: "chatgpt" };
 }
 
-function buildRoomPrompt(room: Room, agent: Agent, mentionTargets: MentionTarget[], turn: RoomTurn): string {
+function buildRoomPrompt(room: Room, agent: Agent, mentionTargets: MentionTarget[], tasks: Task[], availableAgents: Agent[], turn: RoomTurn): string {
   const role = room.roomRoles?.[agent.id] ?? agent.role;
   const transcript = room.messages
     .slice(-12)
@@ -1884,7 +1934,12 @@ function buildRoomPrompt(room: Room, agent: Agent, mentionTargets: MentionTarget
     "Contribute directly to this room's shared work. Do not describe yourself as the general coordinator and do not repeat the entire transcript.",
     `Room participant handles:\n${mentionTargets.map((target) => `- @${target.handle}: ${target.name}${target.role ? ` (${room.roomRoles?.[target.id] ?? target.role})` : " (person)"}`).join("\n")}\nUse the exact @handle when directly addressing another participant. Do not invent handles.`,
     transcript.length > 0 ? `Recent room transcript:\n${transcript}` : "There is no earlier transcript yet.",
-    `New message from You:\n${turn.content}`,
+    `New message from ${turn.author ?? "You"}:\n${turn.content}`,
+    agent.id === "lead" && /\b(?:assign|delegate|reassign)\b/iu.test(turn.content) && /\b(?:tasks?|cards?|work)\b/iu.test(turn.content) ? [
+      `Queued tasks saved from this room:\n${tasks.filter((task) => task.status === "queued").map((task) => `- ${task.id}: ${task.title} (currently ${task.assigneeId})`).join("\n") || "None yet"}`,
+      `Available room agents:\n${availableAgents.map((candidate) => `- ${candidate.id}: ${candidate.name} (${candidate.role}) — ${candidate.description}`).join("\n")}`,
+      "Choose a suitable available room agent for each queued task you are assigning. Match the work to distinct strengths where useful: writing to Writer, product sequencing to Planner, evidence to Researcher, and quality checks to Reviewer. Include a short human-readable recommendation, then exactly one machine-readable block: <task-assignments>[{\"taskId\":\"existing-task-id\",\"assigneeId\":\"available-agent-id\"}]</task-assignments>. Use exact ids from the lists, no Markdown code fence, no duplicate task ids, and at most 12 tasks. The app will save validated changes after your reply. Do not claim the changes are saved yourself.",
+    ].join("\n\n") : "",
     "Return one focused contribution for the other room participants. Mention concrete next steps, evidence, drafts, risks, or questions that fit your role.",
   ].join("\n\n");
 }
