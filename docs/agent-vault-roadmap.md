@@ -170,6 +170,23 @@ Status: **Planned**
 - [ ] Make every result explainable through task, agent, tool, and artifact links.
 - [ ] Measure autonomy, reliability, intervention, and recovery.
 
+## Testing cadence
+
+Every feature slice must include verification before it is committed:
+
+- Unit tests for state transitions, parsers, validation, persistence, and
+  retry/idempotency behavior.
+- API/integration tests for route contracts, database migrations, recovery, and
+  safety gates.
+- Live UI smoke tests for the changed user flow, including empty, loading,
+  error, and success states where applicable.
+- Accessibility checks for new controls and keyboard-driven interactions.
+
+Run the narrowest relevant checks during implementation, then run the full
+typecheck, build, and affected UI smoke flow before pushing. Record each result
+in the implementation record for the active phase. No feature is complete when
+only the backend or only the visual surface has been tested.
+
 ## Completion rule
 
 A phase is complete only after its acceptance criteria pass, its data path is
