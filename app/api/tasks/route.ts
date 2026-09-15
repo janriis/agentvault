@@ -1,5 +1,9 @@
 import { NextResponse } from "next/server";
-import { claimTaskRun, finishTaskRun } from "@/agent/lib/vault-database";
+import { claimTaskRun, finishTaskRun, listTaskRuns } from "@/agent/lib/vault-database";
+
+export async function GET() {
+  return NextResponse.json({ runs: listTaskRuns() });
+}
 
 export async function POST(request: Request) {
   const payload = await request.json().catch(() => null) as { action?: unknown; taskId?: unknown; taskRevision?: unknown; agentId?: unknown; result?: unknown; error?: unknown } | null;

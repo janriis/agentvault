@@ -97,10 +97,11 @@ Implementation record:
 
 ### Phase 2 — Reliable orchestration engine
 
-Status: **In progress — task-run ledger slice implemented 2026-09-15**
+Status: **In progress — task-run ledger and board projection slices implemented 2026-09-15**
 
 - [x] Add a durable task-run ledger and connect assigned agent runners to it.
 - [x] Reclaim stale active runs using the persisted task timeout policy.
+- [x] Project durable active and completed runs back onto the Task Board.
 - [ ] Define durable task state transitions and acceptance criteria.
 - [ ] Add task dependencies, idempotency keys, retries, and cancellation.
 - [ ] Add a persistent worker/runner for queued agent tasks.
@@ -122,6 +123,9 @@ Implementation record:
 6. Added stale-run recovery: a task whose active heartbeat is older than the
    configured timeout can be claimed again, allowing interrupted browser work
    to resume on the next runner pass.
+7. Added `GET /api/tasks` and a five-second board reconciliation loop so durable
+   run state survives a browser refresh and updates the visible task card.
+8. Verification: `npm run typecheck` and `git diff --check` passed.
 
 ### Phase 3 — Real workspace and file operations
 

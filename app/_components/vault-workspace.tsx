@@ -657,6 +657,27 @@ export function VaultWorkspace() {
   }, [activity, agents, backendReady, people, rooms, tasks]);
 
   useEffect(() => {
+    if (!backendReady) return;
+    const reconcileRuns = () => {
+      void fetch("/api/tasks", { cache: "no-store" })
+        .then(async (response) => response.ok ? await response.json() as { runs?: Array<{ taskId: string; taskRevision: number; status: "active" | "completed" | "failed" | "blocked"; result?: string; error?: string }> } : null)
+        .then((payload) => {
+          const runs = payload?.runs ?? [];
+          if (runs.length === 0) return;
+          setTasks((current) => current.map((task) => {
+            const run = runs.find((candidate) => candidate.taskId === task.id && candidate.taskRevision === (task.revision ?? 0));
+            if (!run || run.status === "failed") return task;
+            return { ...task, status: run.status === "active" ? "active" : run.status, ...(run.result ? { result: run.result } : {}), updated: "Just now" };
+          }));
+        })
+        .catch(() => undefined);
+    };
+    reconcileRuns();
+    const timer = window.setInterval(reconcileRuns, 5000);
+    return () => window.clearInterval(timer);
+  }, [backendReady]);
+
+  useEffect(() => {
     try {
       if (!backendReady) return;
       localStorage.setItem(STORAGE_KEY, JSON.stringify({ agents, people, rooms, tasks, artifacts, activity }));

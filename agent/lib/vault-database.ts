@@ -222,6 +222,10 @@ export function finishTaskRun(taskId: string, taskRevision: number, outcome: { s
   }
 }
 
+export function listTaskRuns(): TaskRunRecord[] {
+  return getDatabase().prepare("SELECT task_id, task_revision, agent_id, status, attempt, result, error, started_at, finished_at, updated_at FROM task_runs ORDER BY updated_at DESC").all().flatMap((row) => parseTaskRunRow(row as Record<string, unknown>) ?? []);
+}
+
 export function getVaultSettings(): VaultSettings {
   const row = getDatabase().prepare("SELECT settings_json FROM vault_settings WHERE id = ?").get("default") as { settings_json?: string } | undefined;
   if (!row?.settings_json) return defaultVaultSettings();
@@ -339,6 +343,10 @@ function integerInRange(value: unknown, min: number, max: number, fallback: numb
 
 function readTaskRun(db: DatabaseSync, taskId: string): TaskRunRecord | undefined {
   const row = db.prepare("SELECT task_id, task_revision, agent_id, status, attempt, result, error, started_at, finished_at, updated_at FROM task_runs WHERE task_id = ?").get(taskId) as Record<string, unknown> | undefined;
+  return row ? parseTaskRunRow(row) : undefined;
+}
+
+function parseTaskRunRow(row: Record<string, unknown>): TaskRunRecord | undefined {
   if (!row || typeof row.task_id !== "string" || typeof row.task_revision !== "number" || typeof row.agent_id !== "string" || typeof row.status !== "string" || typeof row.attempt !== "number" || typeof row.started_at !== "string" || typeof row.updated_at !== "string") return undefined;
   if (row.status !== "active" && row.status !== "completed" && row.status !== "failed" && row.status !== "blocked") return undefined;
   return {
