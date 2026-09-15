@@ -1,6 +1,7 @@
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { unmetTaskDependencies, validateTaskDependencies } from "./task-dependencies.ts";
 
 export interface PersistedVaultState {
   agents: unknown[];
@@ -46,9 +47,26 @@ export interface VaultSettings {
 }
 
 export class VaultStateConflictError extends Error {
-  constructor(public readonly currentRevision: number) {
+  readonly currentRevision: number;
+
+  constructor(currentRevision: number) {
     super("The vault changed in another session. Reload before saving again.");
     this.name = "VaultStateConflictError";
+    this.currentRevision = currentRevision;
+  }
+}
+
+export class TaskClaimError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TaskClaimError";
+  }
+}
+
+export class VaultStateValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "VaultStateValidationError";
   }
 }
 
@@ -68,6 +86,8 @@ export function getVaultState(): VaultStateRecord | undefined {
 
 export function saveVaultState(state: PersistedVaultState, expectedRevision?: number): VaultStateRecord {
   const db = getDatabase();
+  const taskError = validateTaskDependencies(state.tasks as Array<{ id: string; dependsOn?: string[]; status: string }>);
+  if (taskError) throw new VaultStateValidationError(taskError);
   db.exec("BEGIN IMMEDIATE");
   try {
     const current = db.prepare("SELECT revision FROM vault_state WHERE id = ?").get("default") as { revision?: number } | undefined;
@@ -159,13 +179,20 @@ export function claimTaskRun(taskId: string, taskRevision: number, agentId: stri
   const db = getDatabase();
   db.exec("BEGIN IMMEDIATE");
   try {
+    const state = getVaultState()?.state;
+    const tasks = (state?.tasks ?? []) as Array<{ id: string; assigneeId: string; assigneeType: string; status: string; revision?: number; dependsOn?: string[] }>;
+    const task = tasks.find((item) => item.id === taskId);
+    if (!task || task.assigneeType !== "agent" || task.assigneeId !== agentId || (task.revision ?? 0) !== taskRevision) {
+      throw new TaskClaimError("The saved task assignment or revision does not match this claim.");
+    }
+    if (task.status !== "queued" && task.status !== "active") throw new TaskClaimError("This task is not ready to run.");
+    const waitingFor = unmetTaskDependencies(task, tasks);
+    if (waitingFor.length > 0) throw new TaskClaimError(`Waiting for prerequisites: ${waitingFor.join(", ")}.`);
     const current = readTaskRun(db, taskId);
     const timeoutMs = getVaultSettings().taskTimeoutMinutes * 60_000;
     const activeRunIsFresh = current?.status === "active" && Date.now() - Date.parse(current.updatedAt) < timeoutMs;
-    if (current && current.taskRevision === taskRevision && (activeRunIsFresh || current.status === "completed")) {
-      db.exec("COMMIT");
-      return current;
-    }
+    if (current && current.taskRevision === taskRevision && activeRunIsFresh) throw new TaskClaimError("Another runner already owns this task.");
+    if (current && current.taskRevision === taskRevision && (current.status === "completed" || current.status === "blocked" || current.status === "cancelled")) throw new TaskClaimError("This run is already finished. Retry with a new task revision.");
     const now = new Date().toISOString();
     const record: TaskRunRecord = {
       taskId,
@@ -207,18 +234,14 @@ export function cancelTaskRun(taskId: string, taskRevision: number): TaskRunReco
   return { ...current, status: "cancelled", finishedAt: now, updatedAt: now };
 }
 
-export function finishTaskRun(taskId: string, taskRevision: number, outcome: { status: "completed"; result: string } | { status: "failed"; error: string }): TaskRunRecord | undefined {
+export function finishTaskRun(taskId: string, taskRevision: number, attempt: number, outcome: { status: "completed"; result: string } | { status: "failed"; error: string }): TaskRunRecord | undefined {
   const db = getDatabase();
   db.exec("BEGIN IMMEDIATE");
   try {
     const current = readTaskRun(db, taskId);
-    if (!current || current.taskRevision !== taskRevision) {
+    if (!current || current.taskRevision !== taskRevision || current.attempt !== attempt || current.status !== "active") {
       db.exec("ROLLBACK");
-      return current;
-    }
-    if (current.status === "completed" || current.status === "blocked") {
-      db.exec("COMMIT");
-      return current;
+      return undefined;
     }
     const now = new Date().toISOString();
     const status = outcome.status === "failed" && current.attempt >= getVaultSettings().maxTaskAttempts ? "blocked" : outcome.status;

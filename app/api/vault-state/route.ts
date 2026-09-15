@@ -3,6 +3,7 @@ import {
   getVaultState,
   saveVaultState,
   VaultStateConflictError,
+  VaultStateValidationError,
   type PersistedVaultState,
 } from "@/agent/lib/vault-database";
 import { maybeCreateScheduledBackup } from "@/agent/lib/vault-export";
@@ -28,6 +29,9 @@ export async function POST(request: Request) {
   } catch (error) {
     if (error instanceof VaultStateConflictError) {
       return NextResponse.json({ error: error.message, currentRevision: error.currentRevision }, { status: 409 });
+    }
+    if (error instanceof VaultStateValidationError) {
+      return NextResponse.json({ error: error.message }, { status: 400 });
     }
     return NextResponse.json({ error: "The vault state could not be saved." }, { status: 500 });
   }

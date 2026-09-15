@@ -122,6 +122,9 @@ an agent task queues it for another run with the new instructions.
 Active agent runs can be cancelled from their card, and blocked runs can be
 retried with a fresh revision. Durable run status is projected back onto the
 board so a refresh does not hide work already claimed by an agent.
+Open a task to choose other tasks it must wait for. The board shows when a task
+has unfinished prerequisites, and the backend refuses to claim it until those
+tasks are completed. Circular or missing prerequisites are rejected.
 
 In a room, use **Task** to create a board item with the room attached. If an
 agent has already written task cards in the conversation, use **Extract tasks**

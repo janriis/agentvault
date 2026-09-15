@@ -103,6 +103,8 @@ Status: **In progress — task-run ledger and board projection slices implemente
 - [x] Reclaim stale active runs using the persisted task timeout policy.
 - [x] Project durable active and completed runs back onto the Task Board.
 - [x] Add explicit cancel and retry controls for agent-owned tasks.
+- [x] Add prerequisite graphs and prevent claims until they are complete.
+- [x] Fence task results to the active attempt and saved task revision.
 - [ ] Define durable task state transitions and acceptance criteria.
 - [ ] Add task dependencies, idempotency keys, retries, and cancellation.
 - [ ] Add a persistent worker/runner for queued agent tasks.
@@ -131,6 +133,13 @@ Implementation record:
    and retrying blocked work with a fresh task revision.
 10. Removed SSR-unsafe relative timestamp rendering from artifact cards; the
     label is now deterministic across server render and hydration.
+11. Added prerequisite editing and graph validation. Claims now check the
+    persisted assignment, revision, status, and completed prerequisites.
+12. Result updates require the claimed attempt, so late results from cancelled
+    or superseded attempts cannot overwrite current work.
+13. Verification: five focused unit and isolated SQLite integration checks
+    passed, plus TypeScript and a production build. The built UI exposed the
+    prerequisite field in the Task Board editor.
 
 ### Phase 3 — Real workspace and file operations
 
