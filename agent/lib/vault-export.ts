@@ -3,7 +3,7 @@ import path from "node:path";
 import { listStoredAgentSessions } from "./agent-sessions";
 import { listStoredAgents } from "./agent-registry";
 import { deleteStoredArtifact, listStoredArtifacts, upsertStoredArtifact, type StoredArtifact } from "./artifact-store";
-import { getVaultState, replaceDatabaseAgents, replaceDatabaseArtifacts, replaceDatabaseSessions, saveVaultState } from "./vault-database";
+import { getVaultSettings, getVaultState, replaceDatabaseAgents, replaceDatabaseArtifacts, replaceDatabaseSessions, saveVaultState } from "./vault-database";
 import { getWorkspaceConfig } from "./workspace-store";
 
 export interface VaultExportDocument {
@@ -49,7 +49,7 @@ export function maybeCreateScheduledBackup(): Promise<{ filename: string; create
   scheduledBackupPromise = (async () => {
     const dataDirectory = process.env.AGENT_VAULT_DATA_DIR ?? path.join(process.cwd(), ".data");
     const backupDirectory = path.join(dataDirectory, "backups");
-    const interval = Number(process.env.AGENT_VAULT_BACKUP_INTERVAL_MS ?? 21_600_000);
+    const interval = Number(process.env.AGENT_VAULT_BACKUP_INTERVAL_MS ?? getVaultSettings().backupIntervalMs);
     const intervalMs = Number.isFinite(interval) && interval > 0 ? interval : 21_600_000;
     try {
       const names = await readdir(backupDirectory);

@@ -7,7 +7,11 @@ import { withEve } from "eve/next";
 // workers and the Next.js API routes read the same data.
 process.env.AGENT_VAULT_DATA_DIR ??= path.join(process.cwd(), ".data");
 
-const nextConfig: NextConfig = {};
+const nextConfig: NextConfig = {
+  // Keep Node's built-in SQLite driver in the Node runtime. This is required
+  // by Next's development server when route handlers are bundled as ESM.
+  serverExternalPackages: ["node:sqlite"],
+};
 
 export default withEve(nextConfig, {
   agents: {

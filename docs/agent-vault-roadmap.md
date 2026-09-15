@@ -81,11 +81,26 @@ Implementation record:
     agents, 15 sessions, 4 artifacts, and a new vault revision. A restore
     request without explicit confirmation returned HTTP 400.
 
+### Settings foundation — completed 2026-09-15
+
+- [x] Persist global workspace, model, task, backup, and safety settings in SQLite.
+- [x] Add a dedicated Settings screen with accessible controls and save feedback.
+- [x] Make maximum task attempts and automatic backup intervals read the saved policy.
+- [x] Reserve timeout and confirmation policy values for the persistent worker and centralized safety engine.
+
+Implementation record:
+
+1. Added migration 5 and a validated `vault_settings` record with safe defaults.
+2. Added `/api/settings` read/write endpoints so settings are shared across browser sessions.
+3. Added the Settings workspace view with workspace, model, task, backup, and safety sections.
+4. Verification: `npm run typecheck` passed after adding the settings route and UI.
+
 ### Phase 2 — Reliable orchestration engine
 
 Status: **In progress — task-run ledger slice implemented 2026-09-15**
 
 - [x] Add a durable task-run ledger and connect assigned agent runners to it.
+- [x] Reclaim stale active runs using the persisted task timeout policy.
 - [ ] Define durable task state transitions and acceptance criteria.
 - [ ] Add task dependencies, idempotency keys, retries, and cancellation.
 - [ ] Add a persistent worker/runner for queued agent tasks.
@@ -104,6 +119,9 @@ Implementation record:
    record completion or failure after the model turn settles.
 5. Verification: task claim and completion returned HTTP 200, recorded attempt
    1 and the result, and did not change the existing Task Board state.
+6. Added stale-run recovery: a task whose active heartbeat is older than the
+   configured timeout can be claimed again, allowing interrupted browser work
+   to resume on the next runner pass.
 
 ### Phase 3 — Real workspace and file operations
 

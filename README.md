@@ -28,6 +28,13 @@ The default model is **ChatGPT subscription**, which uses your local ChatGPT
 login and does not require an API key. If EVE asks you to authenticate, open
 `/model` and choose **Provider → ChatGPT subscription**.
 
+Open **Settings** in the workspace navigation to configure the vault name,
+default provider, Ollama address, task attempt and timeout policies, automatic
+backup interval, and confirmation policy. These settings are stored in the
+durable SQLite backend rather than browser state. Maximum task attempts and
+automatic backup scheduling are active now; timeout and confirmation settings
+are recorded as the central policy for the persistent worker and safety engine.
+
 ## Use local Ollama models
 
 Install and start [Ollama](https://ollama.com), then download at least one

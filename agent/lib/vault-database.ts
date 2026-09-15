@@ -35,6 +35,16 @@ export interface TaskRunRecord {
   updatedAt: string;
 }
 
+export interface VaultSettings {
+  workspaceName: string;
+  defaultModel: "chatgpt-subscription" | "ollama";
+  ollamaHost: string;
+  maxTaskAttempts: number;
+  taskTimeoutMinutes: number;
+  backupIntervalMs: number;
+  confirmationMode: "risky-actions" | "all-actions";
+}
+
 export class VaultStateConflictError extends Error {
   constructor(public readonly currentRevision: number) {
     super("The vault changed in another session. Reload before saving again.");
@@ -150,7 +160,9 @@ export function claimTaskRun(taskId: string, taskRevision: number, agentId: stri
   db.exec("BEGIN IMMEDIATE");
   try {
     const current = readTaskRun(db, taskId);
-    if (current && current.taskRevision === taskRevision && (current.status === "active" || current.status === "completed")) {
+    const timeoutMs = getVaultSettings().taskTimeoutMinutes * 60_000;
+    const activeRunIsFresh = current?.status === "active" && Date.now() - Date.parse(current.updatedAt) < timeoutMs;
+    if (current && current.taskRevision === taskRevision && (activeRunIsFresh || current.status === "completed")) {
       db.exec("COMMIT");
       return current;
     }
@@ -200,7 +212,7 @@ export function finishTaskRun(taskId: string, taskRevision: number, outcome: { s
       return current;
     }
     const now = new Date().toISOString();
-    const status = outcome.status === "failed" && current.attempt >= 3 ? "blocked" : outcome.status;
+    const status = outcome.status === "failed" && current.attempt >= getVaultSettings().maxTaskAttempts ? "blocked" : outcome.status;
     db.prepare("UPDATE task_runs SET status = ?, result = ?, error = ?, finished_at = ?, updated_at = ? WHERE task_id = ?").run(status, outcome.status === "completed" ? outcome.result : null, outcome.status === "failed" ? outcome.error : null, now, now, taskId);
     db.exec("COMMIT");
     return { ...current, status, ...(outcome.status === "completed" ? { result: outcome.result } : { error: outcome.error }), finishedAt: now, updatedAt: now };
@@ -208,6 +220,25 @@ export function finishTaskRun(taskId: string, taskRevision: number, outcome: { s
     db.exec("ROLLBACK");
     throw error;
   }
+}
+
+export function getVaultSettings(): VaultSettings {
+  const row = getDatabase().prepare("SELECT settings_json FROM vault_settings WHERE id = ?").get("default") as { settings_json?: string } | undefined;
+  if (!row?.settings_json) return defaultVaultSettings();
+  try {
+    return normalizeVaultSettings(JSON.parse(row.settings_json));
+  } catch {
+    return defaultVaultSettings();
+  }
+}
+
+export function saveVaultSettings(settings: VaultSettings): VaultSettings {
+  const normalized = normalizeVaultSettings(settings);
+  getDatabase().prepare(`
+    INSERT INTO vault_settings (id, settings_json, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET settings_json = excluded.settings_json, updated_at = excluded.updated_at
+  `).run("default", JSON.stringify(normalized), new Date().toISOString());
+  return normalized;
 }
 
 function getDatabase(): DatabaseSync {
@@ -265,7 +296,45 @@ function getDatabase(): DatabaseSync {
       updated_at TEXT NOT NULL
     );
   `);
+  applyMigration(database, 5, "vault-settings", `
+    CREATE TABLE IF NOT EXISTS vault_settings (
+      id TEXT PRIMARY KEY,
+      settings_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+  `);
   return database;
+}
+
+function defaultVaultSettings(): VaultSettings {
+  return {
+    workspaceName: "Agent Vault",
+    defaultModel: "chatgpt-subscription",
+    ollamaHost: "http://127.0.0.1:11434",
+    maxTaskAttempts: 3,
+    taskTimeoutMinutes: 30,
+    backupIntervalMs: 21_600_000,
+    confirmationMode: "risky-actions",
+  };
+}
+
+function normalizeVaultSettings(value: unknown): VaultSettings {
+  const defaults = defaultVaultSettings();
+  if (!value || typeof value !== "object") return defaults;
+  const candidate = value as Partial<VaultSettings>;
+  return {
+    workspaceName: typeof candidate.workspaceName === "string" && candidate.workspaceName.trim().length > 0 ? candidate.workspaceName.trim().slice(0, 80) : defaults.workspaceName,
+    defaultModel: candidate.defaultModel === "ollama" ? "ollama" : defaults.defaultModel,
+    ollamaHost: typeof candidate.ollamaHost === "string" && candidate.ollamaHost.trim().length > 0 ? candidate.ollamaHost.trim().slice(0, 200) : defaults.ollamaHost,
+    maxTaskAttempts: integerInRange(candidate.maxTaskAttempts, 1, 10, defaults.maxTaskAttempts),
+    taskTimeoutMinutes: integerInRange(candidate.taskTimeoutMinutes, 1, 240, defaults.taskTimeoutMinutes),
+    backupIntervalMs: integerInRange(candidate.backupIntervalMs, 60_000, 604_800_000, defaults.backupIntervalMs),
+    confirmationMode: candidate.confirmationMode === "all-actions" ? "all-actions" : defaults.confirmationMode,
+  };
+}
+
+function integerInRange(value: unknown, min: number, max: number, fallback: number): number {
+  return typeof value === "number" && Number.isInteger(value) ? Math.min(max, Math.max(min, value)) : fallback;
 }
 
 function readTaskRun(db: DatabaseSync, taskId: string): TaskRunRecord | undefined {

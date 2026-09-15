@@ -52,7 +52,7 @@ import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 
-type Section = "overview" | "library" | "rooms" | "tasks" | "artifacts" | "activity";
+type Section = "overview" | "library" | "rooms" | "tasks" | "artifacts" | "activity" | "settings";
 type AgentStatus = "idle" | "working" | "paused" | "blocked";
 type TaskStatus = "queued" | "active" | "blocked" | "completed";
 type TaskAssigneeType = "agent" | "person";
@@ -149,6 +149,16 @@ interface Artifact {
 interface WorkspaceConfig {
   rootPath: string;
   selectedPath: string;
+}
+
+interface VaultSettings {
+  workspaceName: string;
+  defaultModel: "chatgpt-subscription" | "ollama";
+  ollamaHost: string;
+  maxTaskAttempts: number;
+  taskTimeoutMinutes: number;
+  backupIntervalMs: number;
+  confirmationMode: "risky-actions" | "all-actions";
 }
 
 interface WorkspaceDirectory {
@@ -410,7 +420,18 @@ const navItems: Array<{ id: Section; label: string; icon: LucideIcon }> = [
   { id: "tasks", label: "Task Board", icon: ClipboardListIcon },
   { id: "artifacts", label: "Shared Artifacts", icon: FileTextIcon },
   { id: "activity", label: "Activity Timeline", icon: ActivityIcon },
+  { id: "settings", label: "Settings", icon: Settings2Icon },
 ];
+
+const initialSettings: VaultSettings = {
+  workspaceName: "Agent Vault",
+  defaultModel: "chatgpt-subscription",
+  ollamaHost: "http://127.0.0.1:11434",
+  maxTaskAttempts: 3,
+  taskTimeoutMinutes: 30,
+  backupIntervalMs: 21_600_000,
+  confirmationMode: "risky-actions",
+};
 
 export function VaultWorkspace() {
   const [section, setSection] = useState<Section>("overview");
@@ -422,6 +443,8 @@ export function VaultWorkspace() {
   const [activity, setActivity] = useState(initialActivity);
   const [localModels, setLocalModels] = useState<DiscoveredModel[]>([]);
   const [modelsLoading, setModelsLoading] = useState(true);
+  const [settings, setSettings] = useState<VaultSettings>(initialSettings);
+  const [settingsLoading, setSettingsLoading] = useState(true);
   const [selectedRoomId, setSelectedRoomId] = useState("launch-room");
   const [selectedArtifactId, setSelectedArtifactId] = useState("artifact-brief");
   const [search, setSearch] = useState("");
@@ -452,6 +475,31 @@ export function VaultWorkspace() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetch("/api/settings", { cache: "no-store" })
+      .then(async (response) => response.ok ? await response.json() as { settings?: VaultSettings } : null)
+      .then((payload) => {
+        if (!cancelled && payload?.settings) setSettings(payload.settings);
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (!cancelled) setSettingsLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  const saveSettings = async (next: VaultSettings) => {
+    const response = await fetch("/api/settings", {
+      body: JSON.stringify({ settings: next }),
+      headers: { "Content-Type": "application/json" },
+      method: "PUT",
+    });
+    const payload = await response.json() as { error?: string; settings?: VaultSettings };
+    if (!response.ok || !payload.settings) throw new Error(payload.error ?? "Settings could not be saved.");
+    setSettings(payload.settings);
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -1005,6 +1053,8 @@ export function VaultWorkspace() {
         );
       case "activity":
         return <ActivityView activity={activity} />;
+      case "settings":
+        return <SettingsView loading={settingsLoading} onSave={saveSettings} settings={settings} />;
       default:
         return (
           <OverviewView
@@ -1858,6 +1908,69 @@ function ActivityView({ activity }: { readonly activity: ActivityItem[] }) {
 }
 
 function ActivityRow({ item }: { readonly item: ActivityItem }) { const Icon = activityIcon(item.kind); return <div className="flex gap-4 px-5 py-4"><div className={cn("mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-lg", activityTone(item.kind))}><Icon className="size-4" /></div><div className="min-w-0 flex-1"><div className="flex flex-col justify-between gap-1 sm:flex-row sm:items-center"><p className="text-sm font-medium">{item.title}</p><span className="text-[11px] text-muted-foreground">{item.time}</span></div><p className="mt-1 text-xs leading-5 text-muted-foreground">{item.detail}</p>{item.agent ? <Badge className="mt-2" variant="secondary">{item.agent}</Badge> : null}</div></div>; }
+
+function SettingsView({ loading, onSave, settings }: { readonly loading: boolean; readonly onSave: (settings: VaultSettings) => Promise<void>; readonly settings: VaultSettings }) {
+  const [form, setForm] = useState(settings);
+  const [saving, setSaving] = useState(false);
+  const [status, setStatus] = useState<string>();
+  const [error, setError] = useState<string>();
+
+  useEffect(() => setForm(settings), [settings]);
+
+  const update = <K extends keyof VaultSettings>(key: K, value: VaultSettings[K]) => {
+    setForm((current) => ({ ...current, [key]: value }));
+    setStatus(undefined);
+    setError(undefined);
+  };
+
+  const submit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setSaving(true);
+    setStatus(undefined);
+    setError(undefined);
+    try {
+      await onSave(form);
+      setStatus("Settings saved");
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : "Settings could not be saved.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (loading) return <div className="rounded-xl border bg-white p-6 text-sm text-muted-foreground">Loading settings…</div>;
+
+  return <form className="space-y-6" onSubmit={submit}>
+    <PageIntro eyebrow="Settings" title="Make the vault work your way." description="Choose the defaults that guide new rooms, task runs, local models, backups, and safety checks." action={<Button disabled={saving} type="submit">{saving ? "Saving…" : "Save settings"}</Button>} />
+    <div className="grid gap-4 xl:grid-cols-2">
+      <SettingsCard title="Workspace" description="Give this vault a name that makes sense to you.">
+        <label className="space-y-2 text-sm font-medium" htmlFor="workspace-name">Workspace name<Input id="workspace-name" onChange={(event) => update("workspaceName", event.currentTarget.value)} value={form.workspaceName} /></label>
+      </SettingsCard>
+      <SettingsCard title="Model defaults" description="Select the provider used as the starting point for new work.">
+        <label className="space-y-2 text-sm font-medium" htmlFor="default-model">Default model provider<select className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" id="default-model" onChange={(event) => update("defaultModel", event.currentTarget.value as VaultSettings["defaultModel"])} value={form.defaultModel}><option value="chatgpt-subscription">ChatGPT subscription</option><option value="ollama">Ollama local</option></select></label>
+        <label className="space-y-2 text-sm font-medium" htmlFor="ollama-host">Ollama address<Input id="ollama-host" onChange={(event) => update("ollamaHost", event.currentTarget.value)} value={form.ollamaHost} /></label>
+        <p className="text-xs leading-5 text-muted-foreground">The Ollama address is used when local model discovery and execution are enabled.</p>
+      </SettingsCard>
+      <SettingsCard title="Task execution" description="Set guardrails for assigned agent work. These values are saved centrally for every browser and worker.">
+        <div className="grid gap-4 sm:grid-cols-2">
+          <label className="space-y-2 text-sm font-medium" htmlFor="max-attempts">Maximum attempts<Input id="max-attempts" max={10} min={1} onChange={(event) => update("maxTaskAttempts", Number(event.currentTarget.value))} type="number" value={form.maxTaskAttempts} /></label>
+          <label className="space-y-2 text-sm font-medium" htmlFor="task-timeout">Timeout in minutes<Input id="task-timeout" max={240} min={1} onChange={(event) => update("taskTimeoutMinutes", Number(event.currentTarget.value))} type="number" value={form.taskTimeoutMinutes} /></label>
+        </div>
+        <p className="text-xs leading-5 text-muted-foreground">Attempts are enforced by the task-run ledger. Timeout is stored as the policy for the persistent worker.</p>
+      </SettingsCard>
+      <SettingsCard title="Backups and safety" description="Keep durable data recoverable and make risky actions explicit.">
+        <label className="space-y-2 text-sm font-medium" htmlFor="backup-interval">Automatic backup interval<select className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" id="backup-interval" onChange={(event) => update("backupIntervalMs", Number(event.currentTarget.value))} value={form.backupIntervalMs}><option value={3_600_000}>Every hour</option><option value={21_600_000}>Every 6 hours</option><option value={86_400_000}>Every day</option><option value={604_800_000}>Every week</option></select></label>
+        <label className="space-y-2 text-sm font-medium" htmlFor="confirmation-mode">Confirmation policy<select className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" id="confirmation-mode" onChange={(event) => update("confirmationMode", event.currentTarget.value as VaultSettings["confirmationMode"])} value={form.confirmationMode}><option value="risky-actions">Confirm risky and irreversible actions</option><option value="all-actions">Confirm every action</option></select></label>
+        <p className="text-xs leading-5 text-muted-foreground">Backups are created automatically after vault changes. The safety policy is the central rule that future tools will use before acting.</p>
+      </SettingsCard>
+    </div>
+    <div aria-live="polite" className={cn("text-sm", error ? "text-destructive" : "text-emerald-700")}>{error ?? status}</div>
+  </form>;
+}
+
+function SettingsCard({ children, description, title }: { readonly children: ReactNode; readonly description: string; readonly title: string }) {
+  return <section className="space-y-4 rounded-xl border bg-white p-5 shadow-sm"><div><h2 className="font-semibold">{title}</h2><p className="mt-1 text-xs leading-5 text-muted-foreground">{description}</p></div><div className="space-y-4">{children}</div></section>;
+}
 
 function WorkspaceDialog({ open, onClose, onSelected }: { readonly open: boolean; readonly onClose: () => void; readonly onSelected: (workspace: WorkspaceConfig) => void }) {
   const [currentPath, setCurrentPath] = useState(".");
