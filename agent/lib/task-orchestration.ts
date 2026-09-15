@@ -20,6 +20,9 @@ interface VaultAgent {
   description: string;
   context?: string;
   model: string;
+  tools?: string[];
+  permissions?: string[];
+  allowedFolders?: string[];
 }
 
 interface VaultRoom {
@@ -74,6 +77,7 @@ export function buildWorkerTaskPrompt({ task, agent, room }: WorkerJob): string 
     `Assigned task: ${task.title}`,
     `Instructions:\n${task.description}`,
     task.acceptanceCriteria ? `Acceptance criteria — explain how each is met with concrete evidence:\n${task.acceptanceCriteria}` : "Report the result and any unresolved concerns.",
+    agent.tools?.includes("File workspace") ? `The selected host workspace is accessible through workspace_file only for this active task. Read workspace: ${agent.permissions?.includes("Read workspace") ? "allowed" : "denied"}; write workspace: ${agent.permissions?.includes("Write workspace") ? "allowed" : "denied"}; allowed folders: ${(agent.allowedFolders?.length ? agent.allowedFolders : ["."]).join(", ")}. Read first and use the returned SHA-256 when editing. Report changed paths and test outcomes.` : "Host workspace file access is not enabled for this agent.",
     room ? `This task came from the workshop room “${room.name}”. Room purpose: ${room.description}` : "This task was assigned from the Agent Vault task board.",
     "Start working on the task now. Return a concise progress update or completed result with concrete findings, decisions, files, or next steps. Do not only describe how you would approach it.",
   ].join("\n\n");
@@ -84,22 +88,33 @@ export function workerModelContext(agent: VaultAgent): { provider: "chatgpt" } |
   return { provider: "chatgpt" };
 }
 
-export function classifyTaskSessionEvents(events: ReadonlyArray<{ type: string; data?: { message?: string | null; finishReason?: string } }>): { status: "pending" } | { status: "completed"; result: string } | { status: "failed"; error: string } {
-  if (events.some((event) => event.type === "session.failed" || event.type === "turn.failed" || event.type === "turn.cancelled")) return { status: "failed", error: "The resumed EVE session failed or was cancelled." };
-  if (!events.some((event) => event.type === "turn.completed" || event.type === "session.completed")) return { status: "pending" };
-  const message = [...events].reverse().find((event) => event.type === "message.completed" && event.data?.finishReason !== "tool-calls")?.data?.message?.trim();
+export function classifyTaskSessionEvents(events: ReadonlyArray<{ type: string; data?: { message?: string | null; finishReason?: string } }>): { status: "pending" | "waiting-input" } | { status: "completed"; result: string } | { status: "failed"; error: string } {
+  const lastTurn = events.findLastIndex((event) => event.type === "turn.started");
+  const current = lastTurn < 0 ? events : events.slice(lastTurn);
+  if (current.some((event) => event.type === "session.failed" || event.type === "turn.failed" || event.type === "turn.cancelled")) return { status: "failed", error: "The resumed EVE session failed or was cancelled." };
+  const lastInput = [...current].reverse().find((event) => event.type === "input.requested" || event.type === "input.resolved");
+  if (lastInput?.type === "input.requested") return { status: "waiting-input" };
+  if (!current.some((event) => event.type === "turn.completed" || event.type === "session.completed")) return { status: "pending" };
+  const message = [...current].reverse().find((event) => event.type === "message.completed" && event.data?.finishReason !== "tool-calls")?.data?.message?.trim();
   return message ? { status: "completed", result: message } : { status: "failed", error: "The resumed EVE session returned no result." };
 }
 
-export function taskSessionExpired(run: TaskRunRecord, timeoutMinutes: number, now = Date.now()): boolean {
-  return now - Date.parse(run.startedAt) >= timeoutMinutes * 60_000;
+export function lastTaskInputResolvedAt(events: ReadonlyArray<{ type: string; meta?: { at?: string } }>): string | undefined {
+  return [...events].reverse().find((event) => event.type === "input.resolved" && event.meta?.at)?.meta?.at;
 }
 
-export async function runWorkerJob(job: WorkerJob, execute: (job: WorkerJob, run: TaskRunRecord) => Promise<string>): Promise<TaskRunRecord | undefined> {
+export function taskSessionExpired(run: TaskRunRecord, timeoutMinutes: number, now = Date.now(), resumedAt?: string): boolean {
+  const resumedTime = resumedAt ? Date.parse(resumedAt) : NaN;
+  return now - (Number.isFinite(resumedTime) ? Math.max(Date.parse(run.startedAt), resumedTime) : Date.parse(run.startedAt)) >= timeoutMinutes * 60_000;
+}
+
+export async function runWorkerJob(job: WorkerJob, execute: (job: WorkerJob, run: TaskRunRecord) => Promise<string | undefined>): Promise<TaskRunRecord | undefined> {
   const revision = job.task.revision ?? 0;
   const run = claimTaskRun(job.task.id, revision, job.agent.id);
   try {
-    const result = (await execute(job, run)).trim();
+    const output = await execute(job, run);
+    if (output === undefined) return undefined; // A durable EVE turn is waiting for human input.
+    const result = output.trim();
     if (!result) throw new Error("The agent returned no task result.");
     return finishTaskRun(job.task.id, revision, run.attempt, { status: "completed", result });
   } catch (error) {

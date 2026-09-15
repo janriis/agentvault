@@ -71,6 +71,7 @@ interface Agent {
   model: string;
   tools: string[];
   permissions: string[];
+  allowedFolders?: string[];
   context?: string;
   status: AgentStatus;
 }
@@ -187,6 +188,21 @@ interface ActivityItem {
   time: string;
   kind: "decision" | "tool" | "progress" | "failure" | "safety";
   agent?: string;
+}
+
+interface FileChangeItem {
+  operationId: string;
+  taskId: string;
+  agentId: string;
+  action: string;
+  path: string;
+  status: "planned" | "completed" | "failed";
+  createdAt: string;
+}
+
+interface VisibleTaskRun extends ProjectableRun {
+  agentId: string;
+  eveSessionId?: string;
 }
 
 interface VaultStatePayload {
@@ -465,6 +481,8 @@ export function VaultWorkspace() {
   const [backendReady, setBackendReady] = useState(false);
   const [taskActionPending, setTaskActionPending] = useState(false);
   const [taskActionError, setTaskActionError] = useState<string>();
+  const [fileChanges, setFileChanges] = useState<FileChangeItem[]>([]);
+  const [taskRuns, setTaskRuns] = useState<VisibleTaskRun[]>([]);
   const [taskRoomId, setTaskRoomId] = useState<string>();
   const artifactSaveTimers = useRef<Record<string, number>>({});
   const backendRevision = useRef(0);
@@ -476,6 +494,19 @@ export function VaultWorkspace() {
     detail: string;
     confirm: () => void;
   }>();
+
+  const refreshFileChanges = () => {
+    void fetch("/api/workspace/changes", { cache: "no-store" })
+      .then(async (response) => response.ok ? await response.json() as { changes?: FileChangeItem[] } : null)
+      .then((payload) => { if (payload?.changes) setFileChanges(payload.changes); })
+      .catch(() => undefined);
+  };
+
+  useEffect(() => {
+    refreshFileChanges();
+    const timer = window.setInterval(refreshFileChanges, 5000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -721,9 +752,10 @@ export function VaultWorkspace() {
     if (!backendReady) return;
     const reconcileRuns = () => {
       void fetch("/api/tasks", { cache: "no-store" })
-        .then(async (response) => response.ok ? await response.json() as { runs?: ProjectableRun[] } : null)
+        .then(async (response) => response.ok ? await response.json() as { runs?: VisibleTaskRun[] } : null)
         .then((payload) => {
           const runs = payload?.runs ?? [];
+          setTaskRuns((current) => sameJson(current, runs) ? current : runs);
           if (runs.length === 0) return;
           setTasks((current) => projectTaskRuns(current, runs));
         })
@@ -1119,6 +1151,7 @@ export function VaultWorkspace() {
             onCancelRun={cancelTaskRun}
             onCreate={() => openTaskCreator()}
             onRetryRun={retryTaskRun}
+            runs={taskRuns}
             onUpdateTask={updateTask}
           />
         );
@@ -1135,7 +1168,7 @@ export function VaultWorkspace() {
           />
         );
       case "activity":
-        return <ActivityView activity={activity} />;
+        return <ActivityView activity={activity} fileChanges={fileChanges} onRefresh={refreshFileChanges} />;
       case "settings":
         return <SettingsView loading={settingsLoading} onSave={saveSettings} settings={settings} />;
       default:
@@ -1867,7 +1900,7 @@ function latestAssistantText(messages: EveMessageData["messages"]): string {
   return "";
 }
 
-function TasksView({ agents, error, pending, people, rooms, tasks, onCancelRun, onChangeStatus, onCreate, onRetryRun, onUpdateTask }: { readonly agents: Agent[]; readonly error?: string; readonly pending: boolean; readonly people: Person[]; readonly rooms: Room[]; readonly tasks: Task[]; readonly onCancelRun: (task: Task) => void; readonly onChangeStatus: (taskId: string, status: TaskStatus) => void; readonly onCreate: () => void; readonly onRetryRun: (task: Task) => void; readonly onUpdateTask: (task: Task) => Promise<void> }) {
+function TasksView({ agents, error, pending, people, rooms, runs, tasks, onCancelRun, onChangeStatus, onCreate, onRetryRun, onUpdateTask }: { readonly agents: Agent[]; readonly error?: string; readonly pending: boolean; readonly people: Person[]; readonly rooms: Room[]; readonly runs: VisibleTaskRun[]; readonly tasks: Task[]; readonly onCancelRun: (task: Task) => void; readonly onChangeStatus: (taskId: string, status: TaskStatus) => void; readonly onCreate: () => void; readonly onRetryRun: (task: Task) => void; readonly onUpdateTask: (task: Task) => Promise<void> }) {
   const [draggedTaskId, setDraggedTaskId] = useState<string>();
   const [dragOverStatus, setDragOverStatus] = useState<TaskStatus>();
   const [editingTask, setEditingTask] = useState<Task>();
@@ -1881,6 +1914,7 @@ function TasksView({ agents, error, pending, people, rooms, tasks, onCancelRun, 
     <div className="space-y-6">
       <PageIntro eyebrow="Task Board" title="Make the work legible." description="Assign work, drag cards between statuses, and surface blocked tasks before they disappear." action={<Button disabled={pending} onClick={onCreate}><PlusIcon /> Assign task</Button>} />
       {error ? <p aria-live="polite" className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p> : null}
+      {runs.filter((run) => run.status === "active" && run.eveSessionId && tasks.some((task) => task.id === run.taskId && task.revision === run.taskRevision)).map((run) => <a className="inline-flex items-center gap-2 rounded-md border bg-white px-3 py-2 text-xs text-primary hover:bg-accent" href={`/s/${encodeURIComponent(run.eveSessionId!)}?agentId=${encodeURIComponent(run.agentId)}`} key={run.taskId} rel="noopener noreferrer" target="_blank"><BotIcon className="size-4" /> Open {tasks.find((task) => task.id === run.taskId)?.title ?? "agent task"} run · respond to approvals</a>)}
       <div aria-busy={pending} className={cn("grid gap-4 xl:grid-cols-4", pending && "pointer-events-none opacity-60")}>
         {columns.map((column) => { const Icon = column.icon; const columnTasks = tasks.filter((task) => task.status === column.status); const isDropTarget = dragOverStatus === column.status && draggedTaskId !== undefined; return <section className={cn("min-h-96 rounded-xl border bg-white p-3 shadow-sm transition-colors", isDropTarget && "border-primary bg-primary/5")} key={column.status} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; setDragOverStatus(column.status); }} onDrop={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; const taskId = event.dataTransfer.getData("text/plain"); if (taskId) onChangeStatus(taskId, column.status); setDraggedTaskId(undefined); setDragOverStatus(undefined); }}><div className="flex items-center justify-between px-2 py-2"><div className="flex items-center gap-2"><Icon className={cn("size-4", taskTone(column.status))} /><h2 className="text-sm font-semibold">{column.label}</h2><span className="rounded-full bg-muted px-2 py-1 text-[11px] text-muted-foreground">{columnTasks.length}</span></div><Button aria-label={`More ${column.label} options`} size="icon-xs" variant="ghost"><MoreHorizontalIcon /></Button></div><div className="mt-2 space-y-3">{columnTasks.map((task) => <TaskCard agents={agents} isDragging={draggedTaskId === task.id} key={task.id} onCancelRun={onCancelRun} onChangeStatus={onChangeStatus} onDragEnd={() => { setDraggedTaskId(undefined); setDragOverStatus(undefined); }} onDragStart={(taskId) => setDraggedTaskId(taskId)} onEdit={() => setEditingTask(task)} onRetryRun={onRetryRun} people={people} room={rooms.find((room) => room.id === task.roomId)} task={task} tasks={tasks} />)}</div>{columnTasks.length === 0 ? <div className="flex min-h-28 items-center justify-center rounded-lg border border-dashed text-xs text-muted-foreground">Drop a task here</div> : null}</section>; })}
       </div>
@@ -1901,10 +1935,11 @@ function ArtifactsView({ artifacts, selectedArtifact, selectedArtifactId, onChan
   return <div className="space-y-6"><PageIntro eyebrow="Shared Artifacts" title="One place for the work your agents create." description="Keep notes, plans, drafts, files, and outputs connected to the room that produced them." action={<Button onClick={onCreate}><PlusIcon /> New artifact</Button>} /><div className="grid min-h-[620px] overflow-hidden rounded-xl border bg-white shadow-sm lg:grid-cols-[280px_1fr]"><div className="border-b bg-muted/20 p-3 lg:border-r lg:border-b-0"><div className="flex items-center justify-between px-2 py-2"><p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">Recent artifacts</p><Button aria-label="Add artifact" onClick={onCreate} size="icon-xs" variant="ghost"><PlusIcon /></Button></div><div className="space-y-1">{artifacts.map((artifact) => <button className={cn("w-full rounded-lg p-3 text-left", selectedArtifactId === artifact.id ? "bg-primary text-primary-foreground" : "hover:bg-accent")} key={artifact.id} onClick={() => onSelect(artifact.id)} type="button"><div className="flex items-center gap-2"><ArtifactIcon type={artifact.type} /><span className="truncate text-sm font-medium">{artifact.title}</span></div><p className={cn("mt-1 pl-6 text-[11px]", selectedArtifactId === artifact.id ? "text-primary-foreground/70" : "text-muted-foreground")}>{artifact.owner} · {artifactUpdatedLabel(artifact.updated)}</p></button>)}</div></div>{selectedArtifact ? <div className="flex min-w-0 flex-col"><div className="flex flex-col justify-between gap-3 border-b px-5 py-4 sm:flex-row sm:items-center"><div><div className="flex items-center gap-2"><ArtifactIcon type={selectedArtifact.type} /><h2 className="font-semibold">{selectedArtifact.title}</h2></div><p className="mt-1 text-xs text-muted-foreground">Owned by {selectedArtifact.owner} · Edited {artifactUpdatedLabel(selectedArtifact.updated)}</p></div><div className="flex gap-2"><Button onClick={onPublish} size="sm" variant="outline"><ArrowRightIcon /> Publish</Button><Button size="icon-sm" variant="ghost"><MoreHorizontalIcon /></Button></div></div><div className="flex-1 bg-[#fbfcfd] p-5"><Textarea className="h-full min-h-[480px] resize-none border-0 bg-transparent p-0 font-mono text-sm leading-6 shadow-none focus-visible:ring-0" onChange={(event) => onChange(event.currentTarget.value)} value={selectedArtifact.content} /></div></div> : <EmptyState icon={FileTextIcon} title="No artifact selected" detail="Create a note, plan, draft, or file to share with your agents." />}</div></div>;
 }
 
-function ActivityView({ activity }: { readonly activity: ActivityItem[] }) {
+function ActivityView({ activity, fileChanges, onRefresh }: { readonly activity: ActivityItem[]; readonly fileChanges: FileChangeItem[]; readonly onRefresh: () => void }) {
   const [filter, setFilter] = useState<"all" | ActivityItem["kind"]>("all");
-  const filtered = activity.filter((item) => filter === "all" || item.kind === filter);
-  return <div className="space-y-6"><PageIntro eyebrow="Activity Timeline" title="See how the vault is behaving." description="Decisions, tool usage, progress, failures, and safety confirmations in one trace." action={<Button variant="outline"><RefreshCwIcon /> Refresh</Button>} /><div className="flex gap-2 overflow-x-auto pb-1">{["all", "decision", "tool", "progress", "failure", "safety"].map((kind) => <button className={cn("shrink-0 rounded-full border px-3 py-1.5 text-xs font-medium", filter === kind ? "border-primary bg-primary text-primary-foreground" : "bg-white text-muted-foreground hover:bg-accent")} key={kind} onClick={() => setFilter(kind as "all" | ActivityItem["kind"])} type="button">{kind === "all" ? "All activity" : activityLabel(kind as ActivityItem["kind"])}</button>)}</div><section className="rounded-xl border bg-white shadow-sm"><div className="divide-y">{filtered.map((item) => <ActivityRow item={item} key={item.id} />)}</div></section></div>;
+  const fileActivity: ActivityItem[] = fileChanges.map((change) => ({ id: `file-${change.operationId}`, kind: change.status === "failed" ? "failure" : "tool", title: `${change.agentId} · ${change.action} ${change.status}`, detail: `${change.path} · Task ${change.taskId}`, agent: change.agentId, time: change.createdAt }));
+  const filtered = [...activity, ...fileActivity].filter((item) => filter === "all" || item.kind === filter);
+  return <div className="space-y-6"><PageIntro eyebrow="Activity Timeline" title="See how the vault is behaving." description="Decisions, tool usage, progress, failures, and safety confirmations in one trace." action={<Button onClick={onRefresh} variant="outline"><RefreshCwIcon /> Refresh</Button>} /><div className="flex gap-2 overflow-x-auto pb-1">{["all", "decision", "tool", "progress", "failure", "safety"].map((kind) => <button className={cn("shrink-0 rounded-full border px-3 py-1.5 text-xs font-medium", filter === kind ? "border-primary bg-primary text-primary-foreground" : "bg-white text-muted-foreground hover:bg-accent")} key={kind} onClick={() => setFilter(kind as "all" | ActivityItem["kind"])} type="button">{kind === "all" ? "All activity" : activityLabel(kind as ActivityItem["kind"])}</button>)}</div><section className="rounded-xl border bg-white shadow-sm"><div className="divide-y">{filtered.map((item) => <ActivityRow item={item} key={item.id} />)}</div></section></div>;
 }
 
 function ActivityRow({ item }: { readonly item: ActivityItem }) { const Icon = activityIcon(item.kind); return <div className="flex gap-4 px-5 py-4"><div className={cn("mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-lg", activityTone(item.kind))}><Icon className="size-4" /></div><div className="min-w-0 flex-1"><div className="flex flex-col justify-between gap-1 sm:flex-row sm:items-center"><p className="text-sm font-medium">{item.title}</p><span className="text-[11px] text-muted-foreground">{item.time}</span></div><p className="mt-1 text-xs leading-5 text-muted-foreground">{item.detail}</p>{item.agent ? <Badge className="mt-2" variant="secondary">{item.agent}</Badge> : null}</div></div>; }
@@ -2056,9 +2091,10 @@ function SpawnerDialog({ open, onClose, onCreate, localModels, modelsLoading }: 
   const [context, setContext] = useState("Work from the shared room context and report decisions clearly.");
   const [tools, setTools] = useState(["Artifacts", "Task board"]);
   const [permissions, setPermissions] = useState(["Read workspace"]);
+  const [allowedFolders, setAllowedFolders] = useState(".");
   const toggle = (value: string, current: string[], setCurrent: (value: string[]) => void) => setCurrent(current.includes(value) ? current.filter((item) => item !== value) : [...current, value]);
-  const create = () => { const cleanName = name.trim(); if (!cleanName) return; onCreate({ id: `custom-${Date.now()}`, name: cleanName, role, description: job.trim() || context, capabilities: [roleLabel(role).toLowerCase(), "shared context", "focused execution"], model, tools, permissions, context, status: "idle" }); setName(""); setJob(""); };
-  return <Dialog open={open} onOpenChange={(nextOpen) => !nextOpen && onClose()}><DialogContent className="max-w-2xl"><DialogHeader><DialogTitle>Spawn an agent</DialogTitle><DialogDescription>Configure a focused specialist for a job, room, or task.</DialogDescription></DialogHeader><div className="grid gap-5 sm:grid-cols-2"><div className="space-y-4"><Field label="Agent name"><Input onChange={(event) => setName(event.currentTarget.value)} placeholder="e.g. Competitor Scout" value={name} /></Field><Field label="Job / mission"><Input onChange={(event) => setJob(event.currentTarget.value)} placeholder="What should this agent accomplish?" value={job} /></Field><Field label="Role"><select className="h-9 w-full rounded-md border bg-transparent px-3 text-sm" onChange={(event) => setRole(event.currentTarget.value as Role)} value={role}>{["custom", "lead", "researcher", "planner", "writer", "reviewer"].map((value) => <option key={value} value={value}>{roleLabel(value as Role)}</option>)}</select></Field><Field label="Model"><select className="h-9 w-full rounded-md border bg-transparent px-3 text-sm" onChange={(event) => setModel(event.currentTarget.value)} value={model}><option>ChatGPT subscription</option>{localModels.length > 0 ? <optgroup label="Ollama · local">{localModels.map((localModel) => <option key={localModel.id} value={`Ollama · ${localModel.id}`}>{localModel.name}{localModel.details ? ` · ${localModel.details}` : ""}</option>)}</optgroup> : <option disabled>{modelsLoading ? "Scanning for Ollama…" : "Ollama offline"}</option>}<option>Choose after spawning</option></select></Field><Field label="Working context"><Textarea className="min-h-24" onChange={(event) => setContext(event.currentTarget.value)} value={context} /></Field></div><div className="space-y-4"><ChoiceGroup label="Tools" values={["Artifacts", "Task board", "Web search", "File workspace", "Workflow"]} selected={tools} onToggle={(value) => toggle(value, tools, setTools)} /><ChoiceGroup label="Permissions" values={["Read workspace", "Create tasks", "Edit artifacts", "External actions"]} selected={permissions} onToggle={(value) => toggle(value, permissions, setPermissions)} /><div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-900"><div className="flex items-center gap-2 font-medium"><ShieldCheckIcon className="size-4" />Safety defaults are on</div><p className="mt-1 text-amber-800/80">External and irreversible actions will ask for confirmation before running.</p></div></div></div><DialogFooter><Button onClick={onClose} variant="outline">Cancel</Button><Button disabled={name.trim().length === 0} onClick={create}><SparklesIcon /> Spawn agent</Button></DialogFooter></DialogContent></Dialog>;
+  const create = () => { const cleanName = name.trim(); if (!cleanName) return; const folders = allowedFolders.split(",").map((folder) => folder.trim()).filter(Boolean); if (folders.length === 0 || folders.some((folder) => folder !== "." && (folder.startsWith("/") || /^[a-zA-Z]:/u.test(folder) || folder.includes("\\") || folder.split("/").some((part) => !part || part.startsWith("."))))) { window.alert("Use folders inside the selected workspace, such as docs, src, or . for the whole folder."); return; } onCreate({ id: `custom-${Date.now()}`, name: cleanName, role, description: job.trim() || context, capabilities: [roleLabel(role).toLowerCase(), "shared context", "focused execution"], model, tools, permissions, allowedFolders: folders, context, status: "idle" }); setName(""); setJob(""); };
+  return <Dialog open={open} onOpenChange={(nextOpen) => !nextOpen && onClose()}><DialogContent className="max-w-2xl"><DialogHeader><DialogTitle>Spawn an agent</DialogTitle><DialogDescription>Configure a focused specialist for a job, room, or task.</DialogDescription></DialogHeader><div className="grid gap-5 sm:grid-cols-2"><div className="space-y-4"><Field label="Agent name"><Input onChange={(event) => setName(event.currentTarget.value)} placeholder="e.g. Competitor Scout" value={name} /></Field><Field label="Job / mission"><Input onChange={(event) => setJob(event.currentTarget.value)} placeholder="What should this agent accomplish?" value={job} /></Field><Field label="Role"><select className="h-9 w-full rounded-md border bg-transparent px-3 text-sm" onChange={(event) => setRole(event.currentTarget.value as Role)} value={role}>{["custom", "lead", "researcher", "planner", "writer", "reviewer"].map((value) => <option key={value} value={value}>{roleLabel(value as Role)}</option>)}</select></Field><Field label="Model"><select className="h-9 w-full rounded-md border bg-transparent px-3 text-sm" onChange={(event) => setModel(event.currentTarget.value)} value={model}><option>ChatGPT subscription</option>{localModels.length > 0 ? <optgroup label="Ollama · local">{localModels.map((localModel) => <option key={localModel.id} value={`Ollama · ${localModel.id}`}>{localModel.name}{localModel.details ? ` · ${localModel.details}` : ""}</option>)}</optgroup> : <option disabled>{modelsLoading ? "Scanning for Ollama…" : "Ollama offline"}</option>}<option>Choose after spawning</option></select></Field><Field label="Working context"><Textarea className="min-h-24" onChange={(event) => setContext(event.currentTarget.value)} value={context} /></Field></div><div className="space-y-4"><ChoiceGroup label="Tools" values={["Artifacts", "Task board", "Web search", "File workspace", "Workflow"]} selected={tools} onToggle={(value) => toggle(value, tools, setTools)} /><ChoiceGroup label="Permissions" values={["Read workspace", "Write workspace", "Create tasks", "Edit artifacts", "External actions"]} selected={permissions} onToggle={(value) => toggle(value, permissions, setPermissions)} /><Field label="Allowed folders inside selected workspace"><Input aria-label="Allowed workspace folders" onChange={(event) => setAllowedFolders(event.currentTarget.value)} placeholder="., docs, src" value={allowedFolders} /><p className="mt-1 text-xs text-muted-foreground">Comma-separated. “.” allows the selected folder; narrower paths limit file access.</p></Field><div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-900"><div className="flex items-center gap-2 font-medium"><ShieldCheckIcon className="size-4" />Safety defaults are on</div><p className="mt-1 text-amber-800/80">Host files are available only to active assigned tasks with the File workspace tool and matching permissions. Test scripts require approval.</p></div></div></div><DialogFooter><Button onClick={onClose} variant="outline">Cancel</Button><Button disabled={name.trim().length === 0} onClick={create}><SparklesIcon /> Spawn agent</Button></DialogFooter></DialogContent></Dialog>;
 }
 
 function RoomMembersDialog({ open, onClose, onSave, agents, people, selectedAgentIds, selectedPersonIds }: { readonly open: boolean; readonly onClose: () => void; readonly onSave: (agentIds: string[], personIds: string[], invitedPeople: Person[]) => void; readonly agents: Agent[]; readonly people: Person[]; readonly selectedAgentIds: string[]; readonly selectedPersonIds: string[] }) {

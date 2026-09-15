@@ -14,6 +14,7 @@ export interface StoredAgent {
   model: string;
   tools: string[];
   permissions: string[];
+  allowedFolders?: string[];
   context?: string;
 }
 

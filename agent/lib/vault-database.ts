@@ -39,6 +39,30 @@ export interface TaskRunRecord {
   updatedAt: string;
 }
 
+export interface FileChangeRecord {
+  operationId: string;
+  taskId: string;
+  taskRevision: number;
+  agentId: string;
+  eveSessionId: string;
+  action: string;
+  path: string;
+  beforeHash?: string;
+  afterHash?: string;
+  status: "planned" | "completed" | "failed";
+  result?: unknown;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TaskWorktreeRecord {
+  taskId: string;
+  taskRevision: number;
+  sourceRoot: string;
+  worktreeRoot: string;
+  createdAt: string;
+}
+
 export interface VaultSettings {
   workspaceName: string;
   defaultModel: "chatgpt-subscription" | "ollama";
@@ -84,6 +108,62 @@ export function getVaultState(): VaultStateRecord | undefined {
     state: projectVaultState(JSON.parse(row.state_json) as PersistedVaultState),
     revision: row.revision ?? 0,
     updatedAt: row.updated_at ?? new Date(0).toISOString(),
+  };
+}
+
+export function getActiveTaskRunBySession(eveSessionId: string): TaskRunRecord | undefined {
+  const row = getDatabase().prepare("SELECT * FROM task_runs WHERE eve_session_id = ? AND status = 'active'").get(eveSessionId);
+  return row ? parseTaskRunRow(row as Record<string, unknown>) : undefined;
+}
+
+export function getTaskWorktree(taskId: string, taskRevision: number): TaskWorktreeRecord | undefined {
+  const row = getDatabase().prepare("SELECT * FROM task_worktrees WHERE task_id = ? AND task_revision = ?").get(taskId, taskRevision) as Record<string, unknown> | undefined;
+  return row ? { taskId: String(row.task_id), taskRevision: Number(row.task_revision), sourceRoot: String(row.source_root), worktreeRoot: String(row.worktree_root), createdAt: String(row.created_at) } : undefined;
+}
+
+export function saveTaskWorktree(record: TaskWorktreeRecord): TaskWorktreeRecord {
+  getDatabase().prepare("INSERT INTO task_worktrees (task_id, task_revision, source_root, worktree_root, created_at) VALUES (?, ?, ?, ?, ?)")
+    .run(record.taskId, record.taskRevision, record.sourceRoot, record.worktreeRoot, record.createdAt);
+  return record;
+}
+
+export function getFileChange(operationId: string): FileChangeRecord | undefined {
+  const row = getDatabase().prepare("SELECT * FROM file_changes WHERE operation_id = ?").get(operationId) as Record<string, unknown> | undefined;
+  return row ? parseFileChange(row) : undefined;
+}
+
+export function listFileChanges(taskId?: string, limit: number | null = 200): FileChangeRecord[] {
+  const rows = taskId
+    ? getDatabase().prepare("SELECT * FROM file_changes WHERE task_id = ? ORDER BY created_at DESC").all(taskId)
+    : limit === null ? getDatabase().prepare("SELECT * FROM file_changes ORDER BY created_at DESC").all()
+      : getDatabase().prepare("SELECT * FROM file_changes ORDER BY created_at DESC LIMIT ?").all(limit);
+  return rows.map((row) => parseFileChange(row as Record<string, unknown>));
+}
+
+export function beginFileChange(change: Omit<FileChangeRecord, "status" | "result" | "createdAt" | "updatedAt" | "afterHash">): FileChangeRecord {
+  const now = new Date().toISOString();
+  getDatabase().prepare("INSERT INTO file_changes (operation_id, task_id, task_revision, agent_id, eve_session_id, action, path, before_hash, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?)")
+    .run(change.operationId, change.taskId, change.taskRevision, change.agentId, change.eveSessionId, change.action, change.path, change.beforeHash ?? null, now, now);
+  return { ...change, status: "planned", createdAt: now, updatedAt: now };
+}
+
+export function finishFileChange(operationId: string, status: "completed" | "failed", result: unknown, afterHash?: string): FileChangeRecord {
+  getDatabase().prepare("UPDATE file_changes SET status = ?, result_json = ?, after_hash = ?, updated_at = ? WHERE operation_id = ? AND status = 'planned'")
+    .run(status, JSON.stringify(result), afterHash ?? null, new Date().toISOString(), operationId);
+  const record = getFileChange(operationId);
+  if (!record) throw new Error("The file-change audit record is missing.");
+  return record;
+}
+
+function parseFileChange(row: Record<string, unknown>): FileChangeRecord {
+  return {
+    operationId: String(row.operation_id), taskId: String(row.task_id), taskRevision: Number(row.task_revision),
+    agentId: String(row.agent_id), eveSessionId: String(row.eve_session_id), action: String(row.action), path: String(row.path),
+    ...(row.before_hash ? { beforeHash: String(row.before_hash) } : {}),
+    ...(row.after_hash ? { afterHash: String(row.after_hash) } : {}),
+    status: row.status as FileChangeRecord["status"],
+    ...(row.result_json ? { result: JSON.parse(String(row.result_json)) as unknown } : {}),
+    createdAt: String(row.created_at), updatedAt: String(row.updated_at),
   };
 }
 
@@ -331,7 +411,7 @@ export function replaceTaskRuns(runs: TaskRunRecord[]): void {
   }
 }
 
-export function restoreVaultStateWithRuns(state: PersistedVaultState, runs: TaskRunRecord[]): VaultStateRecord {
+export function restoreVaultStateWithRuns(state: PersistedVaultState, runs: TaskRunRecord[], fileChanges: FileChangeRecord[] = []): VaultStateRecord {
   const taskError = validateTaskDependencies(state.tasks as Array<{ id: string; status: string; dependsOn?: string[] }>);
   if (taskError) throw new VaultStateValidationError(taskError);
   const db = getDatabase();
@@ -341,8 +421,12 @@ export function restoreVaultStateWithRuns(state: PersistedVaultState, runs: Task
     const revision = (current?.revision ?? 0) + 1;
     // Imported state starts a new command history; stale responses must never replay.
     db.exec("DELETE FROM task_commands");
+    db.exec("DELETE FROM task_worktrees");
+    db.exec("DELETE FROM file_changes");
     db.exec("DELETE FROM task_runs");
     insertTaskRuns(db, runs);
+    const insertChange = db.prepare("INSERT INTO file_changes (operation_id, task_id, task_revision, agent_id, eve_session_id, action, path, before_hash, after_hash, status, result_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    for (const change of fileChanges) insertChange.run(change.operationId, change.taskId, change.taskRevision, change.agentId, change.eveSessionId, change.action, change.path, change.beforeHash ?? null, change.afterHash ?? null, change.status, change.result === undefined ? null : JSON.stringify(change.result), change.createdAt, change.updatedAt);
     const projectedState = projectVaultState(state);
     const updatedAt = new Date().toISOString();
     db.prepare("INSERT INTO vault_state (id, state_json, revision, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET state_json = excluded.state_json, revision = excluded.revision, updated_at = excluded.updated_at").run("default", JSON.stringify(projectedState), revision, updatedAt);
@@ -449,6 +533,35 @@ function getDatabase(): DatabaseSync {
       command_json TEXT NOT NULL,
       response_json TEXT NOT NULL,
       created_at TEXT NOT NULL
+    );
+  `);
+  applyMigration(database, 8, "workspace-file-changes", `
+    CREATE TABLE IF NOT EXISTS file_changes (
+      operation_id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      task_revision INTEGER NOT NULL,
+      agent_id TEXT NOT NULL,
+      eve_session_id TEXT NOT NULL,
+      action TEXT NOT NULL,
+      path TEXT NOT NULL,
+      before_hash TEXT,
+      after_hash TEXT,
+      status TEXT NOT NULL,
+      result_json TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS file_changes_task_idx ON file_changes(task_id, created_at);
+    CREATE INDEX IF NOT EXISTS task_runs_session_idx ON task_runs(eve_session_id);
+  `);
+  applyMigration(database, 9, "task-worktrees", `
+    CREATE TABLE IF NOT EXISTS task_worktrees (
+      task_id TEXT NOT NULL,
+      task_revision INTEGER NOT NULL,
+      source_root TEXT NOT NULL,
+      worktree_root TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (task_id, task_revision)
     );
   `);
   return database;

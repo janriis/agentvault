@@ -7,7 +7,7 @@ import test from "node:test";
 const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "agent-vault-task-test-"));
 process.env.AGENT_VAULT_DATA_DIR = dataDirectory;
 const { TaskClaimError, attachTaskRunSession, cancelTaskRun, claimTaskRun, executeTaskBoardCommand, finishTaskRun, getVaultSettings, getVaultState, heartbeatTaskRun, listTaskRuns, replaceTaskRuns, restoreVaultStateWithRuns, saveVaultState } = await import("../agent/lib/vault-database.ts");
-const { classifyTaskSessionEvents, findRunnableJobs, runWorkerJob, taskSessionExpired } = await import("../agent/lib/task-orchestration.ts");
+const { classifyTaskSessionEvents, findRunnableJobs, lastTaskInputResolvedAt, runWorkerJob, taskSessionExpired } = await import("../agent/lib/task-orchestration.ts");
 
 const state = (tasks) => ({ agents: [], people: [], rooms: [], tasks, activity: [] });
 const task = (id, status = "queued", dependsOn = []) => ({ id, title: id, description: id, assigneeId: "researcher", assigneeType: "agent", status, revision: 0, dependsOn });
@@ -119,9 +119,20 @@ test("a known EVE session is inspected immediately after worker restart", () => 
 
 test("resumed EVE sessions distinguish pending, completed, and failed turns", () => {
   assert.deepEqual(classifyTaskSessionEvents([{ type: "turn.started" }]), { status: "pending" });
+  assert.deepEqual(classifyTaskSessionEvents([{ type: "input.requested" }]), { status: "waiting-input" });
   assert.deepEqual(classifyTaskSessionEvents([{ type: "message.completed", data: { message: "Done" } }, { type: "turn.completed" }]), { status: "completed", result: "Done" });
+  assert.deepEqual(classifyTaskSessionEvents([{ type: "turn.started" }, { type: "message.completed", data: { message: "Old" } }, { type: "turn.completed" }, { type: "turn.started" }]), { status: "pending" });
   assert.equal(classifyTaskSessionEvents([{ type: "turn.completed" }]).status, "failed");
   assert.equal(classifyTaskSessionEvents([{ type: "turn.cancelled" }]).status, "failed");
+});
+
+test("a worker preserves the active attempt while EVE waits for approval", async () => {
+  const agent = { id: "researcher", name: "Researcher", role: "researcher", description: "Research", model: "ChatGPT subscription" };
+  saveVaultState({ ...state([task("approval-task")]), agents: [agent] });
+  const job = findRunnableJobs().find((item) => item.task.id === "approval-task");
+  assert.ok(job);
+  assert.equal(await runWorkerJob(job, async () => undefined), undefined);
+  assert.equal(listTaskRuns().find((item) => item.taskId === "approval-task")?.status, "active");
 });
 
 test("a resumed pending session expires at the configured task timeout", () => {
@@ -129,6 +140,10 @@ test("a resumed pending session expires at the configured task timeout", () => {
   const run = { taskId: "timeout", taskRevision: 0, agentId: "researcher", status: "active", attempt: 1, startedAt, updatedAt: startedAt };
   assert.equal(taskSessionExpired(run, 30, Date.parse(startedAt) + 29 * 60_000), false);
   assert.equal(taskSessionExpired(run, 30, Date.parse(startedAt) + 30 * 60_000), true);
+  const resolvedAt = "2026-09-15T01:00:00.000Z";
+  assert.equal(lastTaskInputResolvedAt([{ type: "input.requested", meta: { at: startedAt } }, { type: "input.resolved", meta: { at: resolvedAt } }]), resolvedAt);
+  assert.equal(taskSessionExpired(run, 30, Date.parse(resolvedAt) + 29 * 60_000, resolvedAt), false);
+  assert.equal(taskSessionExpired(run, 30, Date.parse(resolvedAt) + 30 * 60_000, resolvedAt), true);
 });
 
 test("vault restore invalidates old task command keys", () => {

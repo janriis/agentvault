@@ -183,42 +183,87 @@ Implementation record:
 24. Made vault-state and task-run replacement one SQLite transaction during
     import. Invalid task graphs and duplicate run records fail before either
     durable record is changed.
-25. Added transactional Task Board commands for create, edit, move, and retry,
-    each with a saved idempotency key and task-revision check. Agent card
-    completion requires a matching completed ledger run; editing active work
-    fences its attempt and queues a new revision.
-26. Routed room-generated tasks and visible board controls through the same
-    command endpoint. Errors remain visible in the editor, and a conflicting
-    browser session cannot overwrite task definitions through generic state
-    saves. Removed the unused browser task runner.
-27. Fixed repeated unchanged-state writes from the browser. In an isolated
-    production UI check, the vault revision stayed unchanged during idle time;
-    a stale task edit displayed a conflict and kept its editor open.
-28. Recovery inspects saved EVE session IDs immediately after worker restart.
-    Pending turns are not duplicated, while failed, cancelled, completed, and
-    timed-out turns settle their attempt. Both live and resumed sessions use
-    the configured timeout policy.
-29. Vault restore clears command replay keys transactionally so an old response
-    cannot be replayed against imported data.
-30. Verification: 22 unit/SQLite checks, TypeScript, and a production build
-    passed. Isolated API/UI checks covered a human-card move, idempotent replay,
-    rejection of manual agent completion and task-definition tampering, and
-    visible cross-session edit conflict. The production build retains the
-    existing dynamic-workspace tracing warnings.
 25. Verification: thirteen focused unit/SQLite checks, TypeScript, and a fresh
     production build passed. The isolated version 1 and version 2 API restore
     flow passed again with the transactional implementation, and the temporary
     server was stopped.
-
+26. Added transactional Task Board commands for create, edit, move, and retry,
+    each with a saved idempotency key and task-revision check. Agent card
+    completion requires a matching completed ledger run; editing active work
+    fences its attempt and queues a new revision.
+27. Routed room-generated tasks and visible board controls through the same
+    command endpoint. Errors remain visible in the editor, and a conflicting
+    browser session cannot overwrite task definitions through generic state
+    saves. Removed the unused browser task runner.
+28. Fixed repeated unchanged-state writes from the browser. In an isolated
+    production UI check, the vault revision stayed unchanged during idle time;
+    a stale task edit displayed a conflict and kept its editor open.
+29. Recovery inspects saved EVE session IDs immediately after worker restart.
+    Pending turns are not duplicated, while failed, cancelled, completed, and
+    timed-out turns settle their attempt. Both live and resumed sessions use
+    the configured timeout policy.
+30. Vault restore clears command replay keys transactionally so an old response
+    cannot be replayed against imported data.
+31. Verification: 22 unit/SQLite checks, TypeScript, and a production build
+    passed. Isolated API/UI checks covered a human-card move, idempotent replay,
+    rejection of manual agent completion and task-definition tampering, and
+    visible cross-session edit conflict. The production build retains the
+    existing dynamic-workspace tracing warnings.
 ### Phase 3 — Real workspace and file operations
 
-Status: **Planned**
+Status: **Complete — 2026-09-15**
 
-- [ ] Bridge the selected host workspace into controlled EVE file tools.
-- [ ] Add read, write, patch, search, move, diff, and test operations.
-- [ ] Enforce per-agent allowed folders and permissions.
-- [ ] Record every file change against a task and agent.
-- [ ] Add isolated worktrees for risky code changes.
+- [x] Bridge the selected host workspace into controlled EVE file tools.
+- [x] Add read, write, patch, search, move, diff, and test operations.
+- [x] Enforce per-agent allowed folders and permissions.
+- [x] Record every file change against a task and agent.
+- [x] Add isolated worktrees for risky code changes.
+
+Implementation record:
+
+1. Read EVE's authored-tool, sandbox, session-context, and human-approval
+   contracts. Host file access is an authored runtime bridge, not an EVE sandbox
+   mount or a general chat capability.
+2. Added migrations 8 and 9 for task-linked file-change audit records and
+   persistent task worktree mappings. A tool call must match an active run by
+   saved EVE session id, task revision, attempt, and assignee.
+3. Added `workspace_file` to the root agent and specialists. It supports
+   bounded text read/search, proposed-content diff, SHA-256-guarded write and
+   exact-match patch, non-overwriting move, and allowlisted test scripts.
+4. Restricted relative paths to the selected folder and the agent's allowed
+   subfolders; hidden/managed paths, symlinks, traversal, and unassigned chat
+   sessions are denied. Writes create a backup, preserve existing permissions,
+   and check that the task attempt is still active before the final mutation.
+5. Added Write workspace and allowed-folder controls to the agent spawner.
+   Test scripts require EVE human approval; active Task Board cards link to the
+   run so the user can answer in the web chat.
+6. Added file-change audit reads to `/api/workspace/changes` and the Activity
+   Timeline. Version 3 portable exports include the full audit metadata;
+   restored worktree paths are intentionally cleared because checkout files
+   themselves are not portable.
+7. Added `workspace_worktree`, which creates a detached checkout from committed
+   HEAD for an active task when the selected folder is a Git repository root.
+   Later file calls for that task use the separate checkout; it does not copy
+   uncommitted source changes or automatically delete the original checkout.
+8. Verification: 31 unit/SQLite checks, TypeScript, Next production build,
+   EVE discovery, and EVE production build passed. An isolated Git repository
+   test confirmed that worktree edits left the original file untouched.
+9. Verification: an isolated production UI showed the spawner controls, a
+   synthetic task-linked file edit in Activity Timeline, and a run link on the
+   Task Board. The API rejected an escaping folder with HTTP 400, and its
+   version 3 export contained the synthetic file-change record. The temporary
+   server and data were removed after testing.
+10. Updated worker recovery for approved test runs: a human-input pause keeps
+    the attempt active, the Task Board can open its EVE session, and the
+    configured timeout restarts when the input is resolved rather than
+    expiring immediately after a long approval wait.
+
+Limitations: model-driven host file calls were not exercised against the real
+vault to avoid subscription/API use and changes to user files. The selected
+workspace remains rooted in the app project (or the
+`AGENT_VAULT_WORKSPACE_ROOT` launch setting); picking an arbitrary outside
+project root directly in the UI is not yet supported. Portable exports carry
+audit metadata, not the bytes of arbitrary host files or Git worktrees.
 
 ### Phase 4 — Autonomous planning and delegation
 

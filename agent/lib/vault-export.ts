@@ -3,13 +3,13 @@ import path from "node:path";
 import { listStoredAgentSessions } from "./agent-sessions";
 import { listStoredAgents } from "./agent-registry";
 import { deleteStoredArtifact, listStoredArtifacts, upsertStoredArtifact, type StoredArtifact } from "./artifact-store";
-import { getVaultSettings, getVaultState, listTaskRuns, replaceDatabaseAgents, replaceDatabaseArtifacts, replaceDatabaseSessions, restoreVaultStateWithRuns, type TaskRunRecord } from "./vault-database";
+import { getVaultSettings, getVaultState, listFileChanges, listTaskRuns, replaceDatabaseAgents, replaceDatabaseArtifacts, replaceDatabaseSessions, restoreVaultStateWithRuns, type FileChangeRecord, type TaskRunRecord } from "./vault-database";
 import { getWorkspaceConfig } from "./workspace-store";
 import { validateTaskDependencies } from "./task-dependencies";
 
 export interface VaultExportDocument {
   format: "agent-vault-export";
-  version: 1 | 2;
+  version: 1 | 2 | 3;
   exportedAt: string;
   workspace: Awaited<ReturnType<typeof getWorkspaceConfig>>;
   vaultState: ReturnType<typeof getVaultState> | null;
@@ -17,12 +17,13 @@ export interface VaultExportDocument {
   sessions: Awaited<ReturnType<typeof listStoredAgentSessions>>;
   artifacts: Awaited<ReturnType<typeof listStoredArtifacts>>;
   taskRuns?: TaskRunRecord[];
+  fileChanges?: FileChangeRecord[];
 }
 
 export async function buildVaultExport(): Promise<VaultExportDocument> {
   return {
     format: "agent-vault-export",
-    version: 2,
+    version: 3,
     exportedAt: new Date().toISOString(),
     workspace: await getWorkspaceConfig(),
     vaultState: getVaultState() ?? null,
@@ -30,6 +31,7 @@ export async function buildVaultExport(): Promise<VaultExportDocument> {
     sessions: await listStoredAgentSessions(),
     artifacts: await listStoredArtifacts(),
     taskRuns: listTaskRuns(),
+    fileChanges: listFileChanges(undefined, null),
   };
 }
 
@@ -73,7 +75,7 @@ export async function restoreVaultExport(value: unknown): Promise<{ agents: numb
   if (!isVaultExportDocument(value)) throw new Error("The import file is not a supported Agent Vault export.");
   const taskError = validateTaskDependencies(value.vaultState.state.tasks as Array<{ id: string; status: string; dependsOn?: string[] }>);
   if (taskError) throw new Error(`The import contains invalid tasks: ${taskError}`);
-  const record = restoreVaultStateWithRuns(value.vaultState.state, value.version === 2 ? value.taskRuns ?? [] : []);
+  const record = restoreVaultStateWithRuns(value.vaultState.state, value.version >= 2 ? value.taskRuns ?? [] : [], value.version === 3 ? value.fileChanges ?? [] : []);
   replaceDatabaseAgents(value.agents.map((agent) => ({ id: agent.id, value: agent })));
   replaceDatabaseSessions(value.sessions.map((session) => ({ id: `${session.agentId}:${session.roomId ?? ""}`, value: session })));
   const importedArtifactIds = new Set(value.artifacts.map((artifact) => artifact.id));
@@ -88,11 +90,17 @@ export async function restoreVaultExport(value: unknown): Promise<{ agents: numb
 function isVaultExportDocument(value: unknown): value is VaultExportDocument & { vaultState: NonNullable<VaultExportDocument["vaultState"]> } {
   if (!value || typeof value !== "object") return false;
   const document = value as Partial<VaultExportDocument>;
-  if (document.format !== "agent-vault-export" || (document.version !== 1 && document.version !== 2) || !Array.isArray(document.agents) || !Array.isArray(document.sessions) || !Array.isArray(document.artifacts) || !document.vaultState || !document.vaultState.state) return false;
-  if (document.version === 2 && (!Array.isArray(document.taskRuns) || !document.taskRuns.every(isRestorableTaskRun))) return false;
+  if (document.format !== "agent-vault-export" || (document.version !== 1 && document.version !== 2 && document.version !== 3) || !Array.isArray(document.agents) || !Array.isArray(document.sessions) || !Array.isArray(document.artifacts) || !document.vaultState || !document.vaultState.state) return false;
+  if (document.version >= 2 && (!Array.isArray(document.taskRuns) || !document.taskRuns.every(isRestorableTaskRun))) return false;
+  if (document.version === 3 && (!Array.isArray(document.fileChanges) || !document.fileChanges.every(isRestorableFileChange))) return false;
   const state = document.vaultState.state;
   if (![state.agents, state.people, state.rooms, state.tasks, state.activity].every(Array.isArray)) return false;
   return document.agents.every((agent) => isRecord(agent) && typeof agent.id === "string" && typeof agent.name === "string") && document.sessions.every((session) => isRecord(session) && typeof session.agentId === "string" && typeof session.eveSessionId === "string") && document.artifacts.every(isRestorableArtifact);
+}
+
+function isRestorableFileChange(value: unknown): value is FileChangeRecord {
+  if (!isRecord(value)) return false;
+  return typeof value.operationId === "string" && value.operationId.length <= 300 && typeof value.taskId === "string" && /^[a-zA-Z0-9_-]{1,160}$/u.test(value.taskId) && Number.isInteger(value.taskRevision) && (value.taskRevision as number) >= 0 && typeof value.agentId === "string" && typeof value.eveSessionId === "string" && typeof value.action === "string" && typeof value.path === "string" && value.path.length <= 1000 && ["planned", "completed", "failed"].includes(String(value.status)) && typeof value.createdAt === "string" && typeof value.updatedAt === "string" && (value.beforeHash === undefined || typeof value.beforeHash === "string") && (value.afterHash === undefined || typeof value.afterHash === "string");
 }
 
 function isRestorableTaskRun(value: unknown): value is TaskRunRecord {

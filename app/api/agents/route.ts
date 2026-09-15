@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { listStoredAgents, upsertStoredAgent, type StoredAgent } from "@/agent/lib/agent-registry";
 import { maybeCreateScheduledBackup } from "@/agent/lib/vault-export";
+import { cleanWorkspaceRelativePath } from "@/agent/lib/workspace-operations";
 
 export async function GET() {
   return NextResponse.json({ agents: await listStoredAgents() });
@@ -12,6 +13,10 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "A valid agent id and name are required." }, { status: 400 });
   }
 
+  let allowedFolders: string[];
+  try { allowedFolders = workspaceFolders(payload.allowedFolders); }
+  catch (error) { return NextResponse.json({ error: error instanceof Error ? error.message : "Allowed folders are invalid." }, { status: 400 }); }
+
   const agent: StoredAgent = {
     id: payload.id,
     name: payload.name.trim(),
@@ -21,12 +26,18 @@ export async function POST(request: Request) {
     model: typeof payload.model === "string" ? payload.model : "ChatGPT subscription",
     tools: stringArray(payload.tools),
     permissions: stringArray(payload.permissions),
+    allowedFolders,
     ...(typeof payload.context === "string" ? { context: payload.context } : {}),
   };
 
   await upsertStoredAgent(agent);
   await maybeCreateScheduledBackup().catch(() => undefined);
   return NextResponse.json({ agent }, { status: 201 });
+}
+
+function workspaceFolders(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length === 0) return ["."];
+  return value.slice(0, 20).map((folder) => cleanWorkspaceRelativePath(folder, true));
 }
 
 function isSafeId(value: unknown): value is string {
