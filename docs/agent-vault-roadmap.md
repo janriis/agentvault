@@ -306,6 +306,13 @@ Implementation record:
    build passed with the existing dynamic-workspace tracing warnings, and the
    live Task Board rendered without browser console errors. No additional
    subscription-backed agent run was triggered during this verification.
+7. Added shared Markdown rendering for Workshop Room messages and Activity
+   Timeline details. Existing headings, paragraphs, numbered and bulleted
+   lists, emphasis, links, tables, and code now render as structured content
+   without migrating saved transcripts. Activity IDs now use UUIDs, while the
+   list safely disambiguates older timestamp collisions. Verification: 40
+   unit/SQLite checks, TypeScript, production build, and both live UI views
+   passed with no browser console errors.
 
 ### Phase 6 — Verification and quality control
 
