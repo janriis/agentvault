@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mentionedRoomAgents, parseRoomAssignments, removeRoomAssignments, validRoomAssignments } from "../agent/lib/room-assignments.ts";
+import { assignedRoomTaskIds, mentionedRoomAgents, parseRoomAssignments, removeRoomAssignments, validRoomAssignments } from "../agent/lib/room-assignments.ts";
 import { applyTaskBoardCommand } from "../agent/lib/task-commands.ts";
 
 const targets = [
@@ -19,6 +19,8 @@ test("lead assignment block is parsed and hidden from the visible reply", () => 
   const reply = 'I assigned the cards.\n<task-assignments>[{"taskId":"task-one","assigneeId":"writer"},{"taskId":"task-two","assigneeId":"lead"}]</task-assignments>';
   assert.deepEqual(parseRoomAssignments(reply), [{ taskId: "task-one", assigneeId: "writer" }, { taskId: "task-two", assigneeId: "lead" }]);
   assert.equal(removeRoomAssignments(reply), "I assigned the cards.");
+  assert.deepEqual(assignedRoomTaskIds(reply, "writer"), ["task-one"]);
+  assert.deepEqual(assignedRoomTaskIds(reply, "reviewer"), []);
 });
 
 test("malformed or duplicate assignments cannot become board commands", () => {

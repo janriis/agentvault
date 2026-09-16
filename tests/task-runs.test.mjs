@@ -6,7 +6,7 @@ import test from "node:test";
 
 const dataDirectory = mkdtempSync(path.join(os.tmpdir(), "agent-vault-task-test-"));
 process.env.AGENT_VAULT_DATA_DIR = dataDirectory;
-const { TaskClaimError, attachTaskRunSession, cancelTaskRun, claimTaskRun, executeTaskBoardCommand, finishTaskRun, getVaultSettings, getVaultState, heartbeatTaskRun, listTaskRuns, replaceTaskRuns, restoreVaultStateWithRuns, saveVaultState } = await import("../agent/lib/vault-database.ts");
+const { TaskClaimError, attachTaskRunSession, cancelTaskRun, claimTaskRun, completeAssignedRoomTasks, executeTaskBoardCommand, finishTaskRun, getVaultSettings, getVaultState, heartbeatTaskRun, listTaskRuns, replaceTaskRuns, restoreVaultStateWithRuns, saveVaultState } = await import("../agent/lib/vault-database.ts");
 const { classifyTaskSessionEvents, findRunnableJobs, lastTaskInputResolvedAt, runWorkerJob, taskSessionExpired } = await import("../agent/lib/task-orchestration.ts");
 
 const state = (tasks) => ({ agents: [], people: [], rooms: [], tasks, activity: [] });
@@ -156,6 +156,32 @@ test("vault restore invalidates old task command keys", () => {
   const after = executeTaskBoardCommand("restore-move-0001", command);
   assert.equal(after.replayed, false);
   assert.equal(after.task.status, "blocked");
+});
+
+test("a specialist room reply completes only its assigned existing cards", () => {
+  const assigned = [
+    { ...task("room-research-a"), roomId: "room-a" },
+    { ...task("room-research-b"), roomId: "room-a" },
+    { ...task("room-writer"), roomId: "room-a", assigneeId: "writer" },
+  ];
+  saveVaultState(state(assigned));
+  const outcome = completeAssignedRoomTasks(["room-research-a", "room-research-b"], "room-a", "researcher", "Evidence and recommendations");
+  assert.equal(outcome.runs.length, 2);
+  assert.deepEqual(outcome.skippedTaskIds, []);
+  assert.equal(getVaultState().state.tasks.filter((item) => item.status === "completed").length, 2);
+  assert.equal(getVaultState().state.tasks.find((item) => item.id === "room-research-a").result, "Evidence and recommendations");
+  assert.equal(getVaultState().state.tasks.find((item) => item.id === "room-writer").status, "queued");
+  assert.throws(() => completeAssignedRoomTasks(["room-writer"], "room-a", "researcher", "Wrong owner"), TaskClaimError);
+});
+
+test("a room reply never overwrites a task already owned by the background worker", () => {
+  saveVaultState(state([{ ...task("room-active"), roomId: "room-a" }]));
+  const claimed = claimTaskRun("room-active", 0, "researcher");
+  const outcome = completeAssignedRoomTasks(["room-active"], "room-a", "researcher", "Parallel room result");
+  assert.deepEqual(outcome.runs, []);
+  assert.deepEqual(outcome.skippedTaskIds, ["room-active"]);
+  assert.equal(listTaskRuns().find((run) => run.taskId === "room-active")?.attempt, claimed.attempt);
+  assert.equal(listTaskRuns().find((run) => run.taskId === "room-active")?.status, "active");
 });
 
 

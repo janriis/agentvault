@@ -32,6 +32,10 @@ export function removeRoomAssignments(content: string): string {
   return content.replace(assignmentBlock, "").trim();
 }
 
+export function assignedRoomTaskIds(content: string, agentId: string): string[] {
+  return parseRoomAssignments(content)?.filter((assignment) => assignment.assigneeId === agentId).map((assignment) => assignment.taskId) ?? [];
+}
+
 export function validRoomAssignments(
   assignments: RoomAssignment[] | undefined,
   roomId: string,

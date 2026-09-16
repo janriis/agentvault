@@ -394,6 +394,80 @@ export function finishTaskRun(taskId: string, taskRevision: number, attempt: num
   }
 }
 
+export function completeAssignedRoomTasks(taskIds: string[], roomId: string, agentId: string, result: string): { runs: TaskRunRecord[]; skippedTaskIds: string[] } {
+  if (!taskIds.length || taskIds.length > 12 || new Set(taskIds).size !== taskIds.length || taskIds.some((id) => !/^[a-zA-Z0-9_-]{1,160}$/u.test(id))) throw new TaskClaimError("The room result needs distinct valid task ids.");
+  if (!/^[a-zA-Z0-9_-]{1,160}$/u.test(roomId) || !/^[a-zA-Z0-9_-]{1,100}$/u.test(agentId)) throw new TaskClaimError("The room and agent ids are invalid.");
+  const trimmedResult = result.trim();
+  if (!trimmedResult || trimmedResult.length > 50_000) throw new TaskClaimError("The room result must contain bounded text.");
+
+  const db = getDatabase();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const state = getVaultState()?.state;
+    const tasks = (state?.tasks ?? []) as Array<{ id: string; assigneeId: string; assigneeType: string; roomId?: string; status: string; revision?: number; dependsOn?: string[] }>;
+    const assignedTasks = taskIds.map((taskId) => tasks.find((task) => task.id === taskId));
+    if (assignedTasks.some((task) => !task || task.roomId !== roomId || task.assigneeType !== "agent" || task.assigneeId !== agentId)) throw new TaskClaimError("The saved room task assignment does not match this result.");
+
+    const runs: TaskRunRecord[] = [];
+    const skippedTaskIds: string[] = [];
+    for (const task of assignedTasks) {
+      if (!task) continue;
+      const revision = task.revision ?? 0;
+      const current = readTaskRun(db, task.id);
+      if (current?.taskRevision === revision && current.status === "completed" && current.agentId === agentId && current.result === trimmedResult) {
+        runs.push(current);
+        continue;
+      }
+      if (task.status !== "queued" || current?.taskRevision === revision && current.status === "active") {
+        skippedTaskIds.push(task.id);
+        continue;
+      }
+      const waitingFor = unmetTaskDependencies(task, tasks).filter((id) => {
+        const dependency = tasks.find((candidate) => candidate.id === id);
+        const dependencyRun = readTaskRun(db, id);
+        return !dependency || !dependencyRun || dependencyRun.status !== "completed" || dependencyRun.taskRevision !== (dependency.revision ?? 0);
+      });
+      if (waitingFor.length > 0) {
+        skippedTaskIds.push(task.id);
+        continue;
+      }
+      const now = new Date().toISOString();
+      const run: TaskRunRecord = {
+        taskId: task.id,
+        taskRevision: revision,
+        agentId,
+        status: "completed",
+        attempt: current?.taskRevision === revision ? current.attempt + 1 : 1,
+        result: trimmedResult,
+        startedAt: now,
+        finishedAt: now,
+        updatedAt: now,
+      };
+      db.prepare(`
+        INSERT INTO task_runs (task_id, task_revision, agent_id, status, attempt, result, error, eve_session_id, started_at, finished_at, updated_at)
+        VALUES (?, ?, ?, 'completed', ?, ?, NULL, NULL, ?, ?, ?)
+        ON CONFLICT(task_id) DO UPDATE SET
+          task_revision = excluded.task_revision,
+          agent_id = excluded.agent_id,
+          status = excluded.status,
+          attempt = excluded.attempt,
+          result = excluded.result,
+          error = NULL,
+          eve_session_id = NULL,
+          started_at = excluded.started_at,
+          finished_at = excluded.finished_at,
+          updated_at = excluded.updated_at
+      `).run(run.taskId, run.taskRevision, run.agentId, run.attempt, trimmedResult, run.startedAt, now, run.updatedAt);
+      runs.push(run);
+    }
+    db.exec("COMMIT");
+    return { runs, skippedTaskIds };
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
 export function listTaskRuns(): TaskRunRecord[] {
   return getDatabase().prepare("SELECT task_id, task_revision, agent_id, status, attempt, result, error, eve_session_id, started_at, finished_at, updated_at FROM task_runs ORDER BY updated_at DESC").all().flatMap((row) => parseTaskRunRow(row as Record<string, unknown>) ?? []);
 }

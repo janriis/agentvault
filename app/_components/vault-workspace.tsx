@@ -55,7 +55,7 @@ import { ThemeSwitcher } from "./theme-provider";
 import { unmetTaskDependencies, validateTaskDependencies } from "@/agent/lib/task-dependencies";
 import { projectTaskRuns, type ProjectableRun } from "@/agent/lib/task-projection";
 import type { TaskBoardCommand } from "@/agent/lib/task-commands";
-import { mentionedRoomAgents, parseRoomAssignments, removeRoomAssignments, validRoomAssignments } from "@/agent/lib/room-assignments";
+import { assignedRoomTaskIds, mentionedRoomAgents, parseRoomAssignments, removeRoomAssignments, validRoomAssignments } from "@/agent/lib/room-assignments";
 
 type Section = "overview" | "library" | "rooms" | "tasks" | "artifacts" | "activity" | "settings";
 type AgentStatus = "idle" | "working" | "paused" | "blocked";
@@ -98,6 +98,7 @@ interface RoomMessage {
   role?: Role;
   content: string;
   time: string;
+  skipTaskExtraction?: boolean;
 }
 
 interface Room {
@@ -988,7 +989,7 @@ export function VaultWorkspace() {
     const messages = extraMessage ? [...room.messages, extraMessage] : room.messages;
     const roomAgents = room.agentIds.map((id) => agents.find((agent) => agent.id === id)).filter((agent): agent is Agent => agent !== undefined);
     const roomPeople = (room.personIds ?? []).map((id) => people.find((person) => person.id === id)).filter((person): person is Person => person !== undefined);
-    const parsedTasks = messages.flatMap((message) => parseTasksFromMessage(message, room, roomAgents, roomPeople));
+    const parsedTasks = messages.filter((message) => !message.skipTaskExtraction).flatMap((message) => parseTasksFromMessage(message, room, roomAgents, roomPeople));
     if (parsedTasks.length === 0) {
       addActivity({ title: "No task cards found", detail: `There were no recognizable task cards in ${room.name}.`, kind: "decision" });
       return;
@@ -1028,7 +1029,7 @@ export function VaultWorkspace() {
     })();
   };
 
-  const appendRoomAgentMessage = (roomId: string, agentId: string, content: string) => {
+  const appendRoomAgentMessage = (roomId: string, agentId: string, content: string, repliedTo?: RoomTurn) => {
     const agent = agents.find((item) => item.id === agentId);
     if (!agent || content.trim().length === 0) return;
     const room = rooms.find((item) => item.id === roomId);
@@ -1041,6 +1042,7 @@ export function VaultWorkspace() {
       role: agent.role,
       content: visibleContent || "I prepared task assignments for this room.",
       time: "Just now",
+      ...((repliedTo?.hop ?? 0) > 0 || assigningLead ? { skipTaskExtraction: true } : {}),
     };
     setRooms((current) =>
       current.map((room) => (room.id === roomId ? { ...room, messages: [...room.messages, message] } : room)),
@@ -1071,7 +1073,29 @@ export function VaultWorkspace() {
           addActivity({ title: `Lead reviewed ${assignments.length} room task${assignments.length === 1 ? "" : "s"}`, detail: `${changed} assignment${changed === 1 ? "" : "s"} changed on the Task Board.`, kind: "decision", agent: agent.name });
         })();
       }
-    } else if (!assigningLead) {
+    } else if (repliedTo && assignedRoomTaskIds(repliedTo.content, agentId).length > 0) {
+      const taskIds = assignedRoomTaskIds(repliedTo.content, agentId);
+      void fetch("/api/room-task-results", {
+        body: JSON.stringify({ taskIds, roomId, agentId, result: visibleContent }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      }).then(async (response) => {
+        const payload = await response.json() as { error?: string; runs?: VisibleTaskRun[]; skippedTaskIds?: string[]; record?: { revision: number; state: VaultStatePayload } };
+        if (!response.ok || !payload.record) throw new Error(payload.error ?? "The assigned room task results could not be saved.");
+        backendRevision.current = payload.record.revision;
+        lastPersistedSnapshot.current = JSON.stringify(payload.record.state);
+        setTasks(payload.record.state.tasks);
+        if (payload.runs) setTaskRuns((current) => [...payload.runs!, ...current.filter((run) => !taskIds.includes(run.taskId))]);
+        const completed = payload.runs?.length ?? 0;
+        const skipped = payload.skippedTaskIds?.length ?? 0;
+        addActivity({
+          title: `${agent.name} returned work for ${taskIds.length} assigned task${taskIds.length === 1 ? "" : "s"}`,
+          detail: skipped > 0 ? `${completed} task result${completed === 1 ? " was" : "s were"} saved; ${skipped} task${skipped === 1 ? " is" : "s are"} already owned by the background worker.` : `${completed} task result${completed === 1 ? " was" : "s were"} saved to the existing cards.`,
+          kind: "progress",
+          agent: agent.name,
+        });
+      }).catch((error: unknown) => addActivity({ title: `${agent.name}'s room result was not linked`, detail: error instanceof Error ? error.message : "The existing task cards were left unchanged.", kind: "failure", agent: agent.name }));
+    } else if (!assigningLead && (repliedTo?.hop ?? 0) === 0) {
       createTasksFromRoom(roomId, message);
     }
     addActivity({
@@ -1696,7 +1720,7 @@ function RoomsView({
   );
 }
 
-function RoomPanel({ agents, people, room, tasks, onSend, onAgentFailure, onAgentMessage, onCreateTask, onCreateTasksFromRoom, onDeleteRoom, onUpdateMembers, onUpdateRoles }: { readonly agents: Agent[]; readonly people: Person[]; readonly room: Room; readonly tasks: Task[]; readonly onSend: (content: string) => void; readonly onAgentFailure: (roomId: string, agentId: string, detail: string) => void; readonly onAgentMessage: (roomId: string, agentId: string, content: string) => void; readonly onCreateTask: () => void; readonly onCreateTasksFromRoom: (roomId: string) => void; readonly onDeleteRoom: (roomId: string) => void; readonly onUpdateMembers: (roomId: string, agentIds: string[], personIds: string[], invitedPeople: Person[]) => void; readonly onUpdateRoles: (roomId: string, roomRoles: Record<string, string>) => void }) {
+function RoomPanel({ agents, people, room, tasks, onSend, onAgentFailure, onAgentMessage, onCreateTask, onCreateTasksFromRoom, onDeleteRoom, onUpdateMembers, onUpdateRoles }: { readonly agents: Agent[]; readonly people: Person[]; readonly room: Room; readonly tasks: Task[]; readonly onSend: (content: string) => void; readonly onAgentFailure: (roomId: string, agentId: string, detail: string) => void; readonly onAgentMessage: (roomId: string, agentId: string, content: string, repliedTo: RoomTurn) => void; readonly onCreateTask: () => void; readonly onCreateTasksFromRoom: (roomId: string) => void; readonly onDeleteRoom: (roomId: string) => void; readonly onUpdateMembers: (roomId: string, agentIds: string[], personIds: string[], invitedPeople: Person[]) => void; readonly onUpdateRoles: (roomId: string, roomRoles: Record<string, string>) => void }) {
   const [draft, setDraft] = useState("");
   const [showRoles, setShowRoles] = useState(false);
   const [showMembers, setShowMembers] = useState(false);
@@ -1748,7 +1772,7 @@ function RoomPanel({ agents, people, room, tasks, onSend, onAgentFailure, onAgen
       <div className="border-t bg-card p-4">
         <div className="rounded-lg border bg-muted/20 p-2 focus-within:border-ring"><Textarea ref={textareaRef} className="min-h-16 resize-none border-0 bg-transparent p-2 shadow-none focus-visible:ring-0" onChange={(event) => { const value = event.currentTarget.value; setDraft(value); setMentionContext(findMentionContext(value, event.currentTarget.selectionStart)); }} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter") { event.preventDefault(); submit(); return; } if (mentionSuggestions.length > 0 && (event.key === "Enter" || event.key === "Tab")) { event.preventDefault(); insertMention(draft, mentionContext, mentionSuggestions[0], setDraft, setMentionContext, textareaRef); return; } if (event.key === "Escape" && mentionContext !== undefined) { event.preventDefault(); setMentionContext(undefined); return; } }} placeholder="Message the room… Use @ to mention someone" value={draft} />{mentionSuggestions.length > 0 ? <div className="mt-1 border-t px-1 pt-1"><p className="px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Mention someone</p><div className="grid gap-1 sm:grid-cols-2">{mentionSuggestions.slice(0, 8).map((target) => <button className="flex items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" key={`${target.kind}:${target.id}`} onMouseDown={(event) => event.preventDefault()} onClick={() => insertMention(draft, mentionContext, target, setDraft, setMentionContext, textareaRef)} type="button"><span className={cn("flex size-6 items-center justify-center rounded-full text-[9px] font-semibold text-white", target.kind === "agent" ? avatarColor(target.role) : "bg-indigo-600")}>{initials(target.name)}</span><span className="min-w-0"><span className="block truncate text-xs font-medium">@{target.handle}</span><span className="block truncate text-[10px] text-muted-foreground">{target.name}{target.role ? ` · ${roleLabel(target.role)}` : " · Person"}</span></span></button>)}</div></div> : null}<div className="flex items-center justify-between px-2 pt-1"><span className="text-[11px] text-muted-foreground">{busyAgentIds.length > 0 ? `${busyAgentIds.length} agent${busyAgentIds.length === 1 ? " is" : "s are"} thinking…` : "⌘ Enter to send · @ mentions supported"}</span><Button disabled={draft.trim().length === 0} onClick={submit} size="sm">Send <ArrowRightIcon /></Button></div></div>
       </div>
-      {activeParticipants.map((agent) => <RoomAgentRunner agent={agent} key={`${room.id}:${agent.id}`} mentionTargets={mentionTargets} tasks={tasks} availableAgents={activeParticipants} onFailure={(detail) => onAgentFailure(room.id, agent.id, detail)} onMessage={(content, repliedTo) => { onAgentMessage(room.id, agent.id, content); if ((repliedTo.hop ?? 0) < 1 && mentionedRoomAgents(content, mentionTargets).some((id) => id !== agent.id)) setTurn({ id: `room-turn-${Date.now()}-${agent.id}`, content, author: agent.name, hop: 1 }); }} onStatus={(busy) => setAgentBusy(agent.id, busy)} room={room} turn={respondingParticipants.includes(agent) ? turn : undefined} />)}
+      {activeParticipants.map((agent) => <RoomAgentRunner agent={agent} key={`${room.id}:${agent.id}`} mentionTargets={mentionTargets} tasks={tasks} availableAgents={activeParticipants} onFailure={(detail) => onAgentFailure(room.id, agent.id, detail)} onMessage={(content, repliedTo) => { onAgentMessage(room.id, agent.id, content, repliedTo); if ((repliedTo.hop ?? 0) < 1 && mentionedRoomAgents(content, mentionTargets).some((id) => id !== agent.id)) setTurn({ id: `room-turn-${Date.now()}-${agent.id}`, content, author: agent.name, hop: 1 }); }} onStatus={(busy) => setAgentBusy(agent.id, busy)} room={room} turn={respondingParticipants.includes(agent) ? turn : undefined} />)}
     </div>
   );
 }
@@ -1923,6 +1947,8 @@ function getRoomModelContext(agent: Agent): { provider: "chatgpt" } | { provider
 
 function buildRoomPrompt(room: Room, agent: Agent, mentionTargets: MentionTarget[], tasks: Task[], availableAgents: Agent[], turn: RoomTurn): string {
   const role = room.roomRoles?.[agent.id] ?? agent.role;
+  const delegatedTaskIds = assignedRoomTaskIds(turn.content, agent.id);
+  const delegatedTasks = delegatedTaskIds.map((taskId) => tasks.find((task) => task.id === taskId)).filter((task): task is Task => task !== undefined);
   const transcript = room.messages
     .slice(-12)
     .map((message) => `${message.author}${message.role ? ` (${message.role})` : ""}: ${message.content}`)
@@ -1939,6 +1965,10 @@ function buildRoomPrompt(room: Room, agent: Agent, mentionTargets: MentionTarget
       `Queued tasks saved from this room:\n${tasks.filter((task) => task.status === "queued").map((task) => `- ${task.id}: ${task.title} (currently ${task.assigneeId})`).join("\n") || "None yet"}`,
       `Available room agents:\n${availableAgents.map((candidate) => `- ${candidate.id}: ${candidate.name} (${candidate.role}) — ${candidate.description}`).join("\n")}`,
       "Choose a suitable available room agent for each queued task you are assigning. Match the work to distinct strengths where useful: writing to Writer, product sequencing to Planner, evidence to Researcher, and quality checks to Reviewer. Include a short human-readable recommendation, then exactly one machine-readable block: <task-assignments>[{\"taskId\":\"existing-task-id\",\"assigneeId\":\"available-agent-id\"}]</task-assignments>. Use exact ids from the lists, no Markdown code fence, no duplicate task ids, and at most 12 tasks. The app will save validated changes after your reply. Do not claim the changes are saved yourself.",
+    ].join("\n\n") : "",
+    delegatedTasks.length > 0 ? [
+      `The Lead assigned these existing Task Board cards to you:\n${delegatedTasks.map((task) => `- ${task.id}: ${task.title}\n  Instructions: ${task.description}\n  Acceptance criteria: ${task.acceptanceCriteria ?? task.description}`).join("\n")}`,
+      "Work on these cards now and return one concrete, completed result that covers each card. The app will attach your reply to these existing cards, so do not propose or recreate them as new tasks.",
     ].join("\n\n") : "",
     "Return one focused contribution for the other room participants. Mention concrete next steps, evidence, drafts, risks, or questions that fit your role.",
   ].join("\n\n");

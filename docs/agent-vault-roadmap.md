@@ -277,12 +277,35 @@ Status: **Planned**
 
 ### Phase 5 — Rooms as execution environments
 
-Status: **Planned**
+Status: **In progress — 2026-09-16**
 
 - [ ] Make rooms own goals, task graphs, decisions, artifacts, and memory.
-- [ ] Turn agent mentions into actionable delegation requests.
+- [x] Turn agent mentions into actionable delegation requests.
 - [ ] Add live run status and room-level blockers.
 - [ ] Preserve room context across sessions and restarts.
+
+Implementation record:
+
+1. Added exact `@` mention routing and one-hop agent-to-agent delivery so a
+   directed room request reaches only its intended specialist.
+2. Added a structured Lead assignment contract. Validated task IDs are
+   reassigned through the durable Task Board command path rather than inferred
+   from prose.
+3. Replayed one previously unanswered Lead request with user approval. The Lead
+   reassigned four cards, and Researcher and Planner returned the requested
+   feature briefs. This exposed a second defect: those replies were parsed as
+   seven additional cards instead of results for the assigned cards.
+4. Linked specialist replies to the exact assignment block that triggered
+   them. A room result now completes those existing cards through the durable
+   run ledger; it cannot overwrite a card already claimed by the background
+   worker.
+5. Marked delegated follow-up messages as ineligible for task extraction, so
+   automatic and manual extraction cannot turn agent progress reports into
+   duplicate cards.
+6. Verification: 40 unit/SQLite checks and TypeScript passed. A production
+   build passed with the existing dynamic-workspace tracing warnings, and the
+   live Task Board rendered without browser console errors. No additional
+   subscription-backed agent run was triggered during this verification.
 
 ### Phase 6 — Verification and quality control
 
