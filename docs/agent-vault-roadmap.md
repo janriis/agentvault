@@ -313,6 +313,13 @@ Implementation record:
    list safely disambiguates older timestamp collisions. Verification: 40
    unit/SQLite checks, TypeScript, production build, and both live UI views
    passed with no browser console errors.
+8. Repaired local model discovery in chat: the endpoint now uses the saved
+   Ollama address and a longer discovery timeout; the picker rescans and
+   retains a selected local model through temporary outages. An unavailable
+   local choice blocks submission explicitly instead of silently using the
+   ChatGPT subscription. Verification: 42 unit checks, TypeScript, production
+   build, and a live UI rescan with five installed Ollama models. No model
+   generation request was sent during testing.
 
 ### Phase 6 — Verification and quality control
 

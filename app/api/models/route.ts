@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { getVaultSettings } from "@/agent/lib/vault-database";
 
 interface DiscoveredModel {
   id: string;
@@ -16,19 +17,17 @@ interface OllamaTagsResponse {
   }>;
 }
 
-const DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434";
-
 export async function GET() {
-  const baseUrl = normalizeBaseUrl(process.env.OLLAMA_HOST ?? DEFAULT_OLLAMA_URL);
+  const baseUrl = normalizeBaseUrl(getVaultSettings().ollamaHost);
 
   if (baseUrl === null) {
-    return NextResponse.json({ providers: [], models: [], errors: ["OLLAMA_HOST must point to a local Ollama server."] });
+    return NextResponse.json({ providers: [], models: [], errors: ["Set a local Ollama address in Settings."] });
   }
 
   try {
     const response = await fetch(`${baseUrl}/api/tags`, {
       cache: "no-store",
-      signal: AbortSignal.timeout(1_500),
+      signal: AbortSignal.timeout(5_000),
     });
 
     if (!response.ok) {
@@ -61,7 +60,7 @@ export async function GET() {
       errors: [],
     });
   } catch {
-    return NextResponse.json({ providers: [], models: [], errors: [] });
+    return NextResponse.json({ providers: [], models: [], errors: [`Could not reach Ollama at ${baseUrl}. Check that it is running, then rescan.`] });
   }
 }
 
