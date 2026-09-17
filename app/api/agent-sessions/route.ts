@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
-import { saveAgentSession, type StoredAgentSession } from "@/agent/lib/agent-sessions";
+import { findAgentSession, saveAgentSession, type StoredAgentSession } from "@/agent/lib/agent-sessions";
 import { maybeCreateScheduledBackup } from "@/agent/lib/vault-export";
+import { diagnosticLog } from "@/agent/lib/diagnostic-log";
 
 export async function POST(request: Request) {
   const payload = await request.json().catch(() => null) as Partial<StoredAgentSession> | null;
@@ -14,7 +15,11 @@ export async function POST(request: Request) {
     ...(typeof payload.roomId === "string" ? { roomId: payload.roomId } : {}),
     updatedAt: new Date().toISOString(),
   };
+  const previous = await findAgentSession(session.agentId, session.roomId);
   await saveAgentSession(session);
+  if (previous?.eveSessionId !== session.eveSessionId) {
+    diagnosticLog("session", "linked", { agentId: session.agentId, sessionId: session.eveSessionId, ...(session.roomId && isSafeId(session.roomId) ? { roomId: session.roomId } : {}) });
+  }
   await maybeCreateScheduledBackup().catch(() => undefined);
   return NextResponse.json({ session }, { status: 201 });
 }

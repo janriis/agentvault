@@ -348,6 +348,15 @@ Implementation record:
     selectors without the duplicate text. Production build verification remains
     pending: both Turbopack and webpack stalled during compilation in this
     checkout without reporting a source error.
+13. Added a bounded diagnostic trail for development startup, task-worker
+    scans, task claims, EVE session lifecycle, and local-model availability.
+    Entries are written to dated JSONL files under `.data/logs` and summarized
+    in the terminal without prompts or full framework error payloads. The
+    `AGENT_VAULT_WORKER=off` switch starts the web server without resuming
+    queued tasks, helping isolate background activity. Logger privacy tests and
+    an idle-worker integration test run against temporary data. TypeScript,
+    54 unit/integration checks, and the production build passed; no saved vault
+    tasks were executed during verification.
 
 ### Phase 6 — Verification and quality control
 

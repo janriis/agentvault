@@ -24,6 +24,18 @@ in its own terminal. The worker and web server must use the same
 `AGENT_VAULT_DATA_DIR`; keep the worker process running to execute tasks when
 no browser is open.
 
+`npm run dev` resumes eligible queued agent work automatically. To inspect the
+web app without starting background tasks, run
+`AGENT_VAULT_WORKER=off npm run dev`. Startup, worker scans, task claims,
+EVE session links, completions, and failures are logged as concise JSON lines
+in the terminal and in `.data/logs/activity-YYYY-MM-DD.jsonl` (under
+`AGENT_VAULT_DATA_DIR` when set). Use
+`tail -f .data/logs/activity-$(date -u +%F).jsonl` to follow today's file.
+Idle scans are summarized at most once a minute, while changes are logged
+immediately. Diagnostic entries contain IDs, status, model provider, and error
+codes, not prompts or full EVE error payloads. EVE's own detailed runtime
+messages may still appear separately in the terminal.
+
 The home screen is the Agent Vault workspace. It includes the Agent Library,
 Agent Spawner, Workshop Rooms, Room Roles, Task Board, Shared Artifacts, and
 Activity Timeline. The existing live EVE conversation remains available at
@@ -49,11 +61,10 @@ model, for example:
 ollama pull qwen3:8b
 ```
 
-Refresh the web app. The model picker scans the local Ollama endpoint at
-`http://127.0.0.1:11434`, lists the models returned by Ollama, and remembers
-your choice in this browser. Delegated specialists use the selected model as
-well. If Ollama is not running, the picker reports **Ollama offline**
-and ChatGPT remains available.
+In **Settings → Model defaults**, select **Ollama local**, check the local
+endpoint at `http://127.0.0.1:11434`, choose an installed model, and save.
+Existing agents and future task attempts then use that local model. If Ollama
+is unavailable, local work fails visibly rather than switching to ChatGPT.
 
 To use a different local Ollama host, set `OLLAMA_HOST` before starting the web
 app. Only loopback hosts are accepted by the discovery route.
