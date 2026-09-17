@@ -1,5 +1,6 @@
 import { claimTaskRun, finishTaskRun, getVaultSettings, getVaultState, listTaskRuns, type TaskRunRecord } from "./vault-database.ts";
 import { unmetTaskDependencies } from "./task-dependencies.ts";
+import { resolveWorkspaceModel } from "./workspace-model.ts";
 
 export interface RunnableTask {
   id: string;
@@ -56,6 +57,7 @@ export function findRunnableJobs(now = Date.now()): WorkerJob[] {
     if (waitingFor.length > 0) return [];
     const agent = agents.find((candidate) => candidate.id === task.assigneeId);
     if (!agent) return [];
+    try { resolveWorkspaceModel(agent.model, settings); } catch { return []; }
     const run = runs.get(task.id);
     if (run && run.taskRevision === (task.revision ?? 0)) {
       if (["completed", "blocked", "cancelled"].includes(run.status)) return [];
@@ -84,8 +86,7 @@ export function buildWorkerTaskPrompt({ task, agent, room }: WorkerJob): string 
 }
 
 export function workerModelContext(agent: VaultAgent): { provider: "chatgpt" } | { provider: "ollama"; baseUrl: string; model: string } {
-  if (agent.model.startsWith("Ollama · ")) return { provider: "ollama", baseUrl: getVaultSettings().ollamaHost, model: agent.model.slice("Ollama · ".length) };
-  return { provider: "chatgpt" };
+  return resolveWorkspaceModel(agent.model, getVaultSettings());
 }
 
 export function classifyTaskSessionEvents(events: ReadonlyArray<{ type: string; data?: { message?: string | null; finishReason?: string } }>): { status: "pending" | "waiting-input" } | { status: "completed"; result: string } | { status: "failed"; error: string } {

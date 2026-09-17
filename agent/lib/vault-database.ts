@@ -67,6 +67,7 @@ export interface VaultSettings {
   workspaceName: string;
   defaultModel: "chatgpt-subscription" | "ollama";
   ollamaHost: string;
+  defaultOllamaModel: string;
   maxTaskAttempts: number;
   taskTimeoutMinutes: number;
   backupIntervalMs: number;
@@ -527,13 +528,48 @@ export function getVaultSettings(): VaultSettings {
   }
 }
 
-export function saveVaultSettings(settings: VaultSettings): VaultSettings {
+export function saveVaultSettings(settings: VaultSettings, applyModelToAgents = false): { settings: VaultSettings; record?: VaultStateRecord } {
   const normalized = normalizeVaultSettings(settings);
-  getDatabase().prepare(`
-    INSERT INTO vault_settings (id, settings_json, updated_at) VALUES (?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET settings_json = excluded.settings_json, updated_at = excluded.updated_at
-  `).run("default", JSON.stringify(normalized), new Date().toISOString());
-  return normalized;
+  if (applyModelToAgents && normalized.defaultModel === "ollama" && !normalized.defaultOllamaModel) {
+    throw new VaultStateValidationError("Choose an installed Ollama model before applying it to agents.");
+  }
+  const db = getDatabase();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const updatedAt = new Date().toISOString();
+    db.prepare(`
+      INSERT INTO vault_settings (id, settings_json, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET settings_json = excluded.settings_json, updated_at = excluded.updated_at
+    `).run("default", JSON.stringify(normalized), updatedAt);
+
+    let record: VaultStateRecord | undefined;
+    if (applyModelToAgents) {
+      const model = normalized.defaultModel === "ollama" ? `Ollama · ${normalized.defaultOllamaModel}` : "ChatGPT subscription";
+      const row = db.prepare("SELECT state_json, revision FROM vault_state WHERE id = ?").get("default") as { state_json: string; revision: number } | undefined;
+      if (row) {
+        const state = JSON.parse(row.state_json) as PersistedVaultState;
+        const nextState = { ...state, agents: state.agents.map((agent) => ({ ...(agent as Record<string, unknown>), model })) };
+        const revision = row.revision + 1;
+        db.prepare("UPDATE vault_state SET state_json = ?, revision = ?, updated_at = ? WHERE id = ?")
+          .run(JSON.stringify(nextState), revision, updatedAt, "default");
+        record = { state: nextState, revision, updatedAt };
+      }
+
+      const registryRows = db.prepare("SELECT id, record_json FROM agent_registry").all() as Array<{ id: string; record_json: string }>;
+      if (registryRows.length > 0) {
+        const update = db.prepare("UPDATE agent_registry SET record_json = ?, updated_at = ? WHERE id = ?");
+        for (const agent of registryRows) update.run(JSON.stringify({ ...JSON.parse(agent.record_json), model }), updatedAt, agent.id);
+      } else if (record) {
+        const insert = db.prepare("INSERT INTO agent_registry (id, record_json, updated_at) VALUES (?, ?, ?)");
+        for (const agent of record.state.agents) insert.run((agent as { id: string }).id, JSON.stringify(agent), updatedAt);
+      }
+    }
+    db.exec("COMMIT");
+    return { settings: normalized, ...(record ? { record } : {}) };
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
 }
 
 function getDatabase(): DatabaseSync {
@@ -646,6 +682,7 @@ function defaultVaultSettings(): VaultSettings {
     workspaceName: "Agent Vault",
     defaultModel: "chatgpt-subscription",
     ollamaHost: "http://127.0.0.1:11434",
+    defaultOllamaModel: "",
     maxTaskAttempts: 3,
     taskTimeoutMinutes: 30,
     backupIntervalMs: 21_600_000,
@@ -661,6 +698,7 @@ function normalizeVaultSettings(value: unknown): VaultSettings {
     workspaceName: typeof candidate.workspaceName === "string" && candidate.workspaceName.trim().length > 0 ? candidate.workspaceName.trim().slice(0, 80) : defaults.workspaceName,
     defaultModel: candidate.defaultModel === "ollama" ? "ollama" : defaults.defaultModel,
     ollamaHost: typeof candidate.ollamaHost === "string" && candidate.ollamaHost.trim().length > 0 ? candidate.ollamaHost.trim().slice(0, 200) : defaults.ollamaHost,
+    defaultOllamaModel: typeof candidate.defaultOllamaModel === "string" ? candidate.defaultOllamaModel.trim().slice(0, 200) : defaults.defaultOllamaModel,
     maxTaskAttempts: integerInRange(candidate.maxTaskAttempts, 1, 10, defaults.maxTaskAttempts),
     taskTimeoutMinutes: integerInRange(candidate.taskTimeoutMinutes, 1, 240, defaults.taskTimeoutMinutes),
     backupIntervalMs: integerInRange(candidate.backupIntervalMs, 60_000, 604_800_000, defaults.backupIntervalMs),

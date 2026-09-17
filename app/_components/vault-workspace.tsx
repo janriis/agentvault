@@ -57,6 +57,7 @@ import { unmetTaskDependencies, validateTaskDependencies } from "@/agent/lib/tas
 import { projectTaskRuns, type ProjectableRun } from "@/agent/lib/task-projection";
 import type { TaskBoardCommand } from "@/agent/lib/task-commands";
 import { assignedRoomTaskIds, mentionedRoomAgents, parseRoomAssignments, removeRoomAssignments, validRoomAssignments } from "@/agent/lib/room-assignments";
+import { resolveWorkspaceModel, workspaceModelLabel } from "@/agent/lib/workspace-model";
 
 type Section = "overview" | "library" | "rooms" | "tasks" | "artifacts" | "activity" | "settings";
 type AgentStatus = "idle" | "working" | "paused" | "blocked";
@@ -167,6 +168,7 @@ interface VaultSettings {
   workspaceName: string;
   defaultModel: "chatgpt-subscription" | "ollama";
   ollamaHost: string;
+  defaultOllamaModel: string;
   maxTaskAttempts: number;
   taskTimeoutMinutes: number;
   backupIntervalMs: number;
@@ -458,6 +460,7 @@ const initialSettings: VaultSettings = {
   workspaceName: "Agent Vault",
   defaultModel: "chatgpt-subscription",
   ollamaHost: "http://127.0.0.1:11434",
+  defaultOllamaModel: "",
   maxTaskAttempts: 3,
   taskTimeoutMinutes: 30,
   backupIntervalMs: 21_600_000,
@@ -547,9 +550,20 @@ export function VaultWorkspace() {
       headers: { "Content-Type": "application/json" },
       method: "PUT",
     });
-    const payload = await response.json() as { error?: string; settings?: VaultSettings };
+    const payload = await response.json() as { error?: string; settings?: VaultSettings; record?: { state: VaultStatePayload; revision: number } };
     if (!response.ok || !payload.settings) throw new Error(payload.error ?? "Settings could not be saved.");
     setSettings(payload.settings);
+    if (payload.record) {
+      backendRevision.current = payload.record.revision;
+      lastPersistedSnapshot.current = JSON.stringify(payload.record.state);
+      setAgents(payload.record.state.agents);
+      setPeople(payload.record.state.people);
+      setRooms(payload.record.state.rooms);
+      setTasks(payload.record.state.tasks);
+      setActivity(payload.record.state.activity);
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(payload.record.state)); } catch { /* Server data remains authoritative. */ }
+    }
+    return payload.record?.state.agents.length ?? 0;
   };
 
   const sendTaskBoardCommand = async (command: TaskBoardCommand): Promise<Task> => {
@@ -1172,6 +1186,7 @@ export function VaultWorkspace() {
         return (
           <LibraryView
             agents={agents}
+            settings={settings}
             search={search}
             onChat={(agentId) => window.location.assign(`/s?agentId=${encodeURIComponent(agentId)}`)}
             onControl={controlAgent}
@@ -1183,6 +1198,7 @@ export function VaultWorkspace() {
         return (
           <RoomsView
             agents={agents}
+            settings={settings}
             people={people}
             rooms={rooms}
             tasks={tasks}
@@ -1232,7 +1248,7 @@ export function VaultWorkspace() {
       case "activity":
         return <ActivityView activity={activity} fileChanges={fileChanges} onRefresh={refreshFileChanges} />;
       case "settings":
-        return <SettingsView loading={settingsLoading} onSave={saveSettings} settings={settings} />;
+        return <SettingsView loading={settingsLoading} localModels={localModels} modelsLoading={modelsLoading} onSave={saveSettings} settings={settings} />;
       default:
         return (
           <OverviewView
@@ -1415,6 +1431,7 @@ export function VaultWorkspace() {
       <SpawnerDialog
         localModels={localModels}
         modelsLoading={modelsLoading}
+        settings={settings}
         onClose={() => setShowSpawner(false)}
         onCreate={createAgent}
         open={showSpawner}
@@ -1554,6 +1571,7 @@ function OverviewView({
 
 function LibraryView({
   agents,
+  settings,
   search,
   onChat,
   onControl,
@@ -1561,6 +1579,7 @@ function LibraryView({
   onSpawn,
 }: {
   readonly agents: Agent[];
+  readonly settings: VaultSettings;
   readonly search: string;
   readonly onChat: (agentId: string) => void;
   readonly onControl: (agentId: string, action: "pause" | "steer" | "retry" | "replace") => void;
@@ -1601,7 +1620,7 @@ function LibraryView({
       </div>
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
         {filtered.map((agent) => (
-          <AgentCard agent={agent} key={agent.id} onChat={onChat} onControl={onControl} onRemove={onRemove} />
+          <AgentCard agent={agent} key={agent.id} onChat={onChat} onControl={onControl} onRemove={onRemove} settings={settings} />
         ))}
         <button className="flex min-h-64 flex-col items-center justify-center rounded-xl border border-dashed bg-card/60 p-6 text-center text-muted-foreground transition-colors hover:border-primary hover:bg-card" onClick={onSpawn} type="button">
           <div className="mb-3 flex size-10 items-center justify-center rounded-full bg-muted"><PlusIcon className="size-5" /></div>
@@ -1615,11 +1634,13 @@ function LibraryView({
 
 function AgentCard({
   agent,
+  settings,
   onChat,
   onControl,
   onRemove,
 }: {
   readonly agent: Agent;
+  readonly settings: VaultSettings;
   readonly onChat: (agentId: string) => void;
   readonly onControl: (agentId: string, action: "pause" | "steer" | "retry" | "replace") => void;
   readonly onRemove: (agentId: string) => void;
@@ -1646,7 +1667,7 @@ function AgentCard({
       </div>
       <Separator className="my-4" />
       <div className="flex items-center justify-between text-[11px] text-muted-foreground">
-        <span className="flex items-center gap-1.5"><CircleDotIcon className="size-3.5" />{agent.model}</span>
+        <span className="flex items-center gap-1.5"><CircleDotIcon className="size-3.5" />{workspaceModelLabel(agent.model, settings)}</span>
         <span>{agent.tools.length} tools</span>
       </div>
       <Button className="mt-4 w-full" onClick={() => onChat(agent.id)} size="sm"><SquarePenIcon />Chat with agent</Button>
@@ -1665,6 +1686,7 @@ function AgentCard({
 
 function RoomsView({
   agents,
+  settings,
   people,
   rooms,
   tasks,
@@ -1682,6 +1704,7 @@ function RoomsView({
   onUpdateRoles,
 }: {
   readonly agents: Agent[];
+  readonly settings: VaultSettings;
   readonly people: Person[];
   readonly rooms: Room[];
   readonly tasks: Task[];
@@ -1715,13 +1738,13 @@ function RoomsView({
           </div>
           <button className="mt-3 flex w-full items-center gap-2 rounded-lg border border-dashed px-3 py-2.5 text-xs text-muted-foreground hover:bg-accent" onClick={onCreate} type="button"><PlusIcon className="size-3.5" />Create workshop room</button>
         </div>
-        {selectedRoom ? <RoomPanel agents={agents} people={people} tasks={tasks.filter((task) => task.roomId === selectedRoom.id)} onAgentFailure={onAgentFailure} onAgentMessage={onAgentMessage} onCreateTask={onCreateTask} onCreateTasksFromRoom={onCreateTasksFromRoom} onDeleteRoom={onDeleteRoom} onSend={onSend} onUpdateMembers={onUpdateMembers} onUpdateRoles={onUpdateRoles} room={selectedRoom} /> : <EmptyState icon={UsersIcon} title="Create a workshop room" detail="Bring specialists together around a shared goal." />}
+        {selectedRoom ? <RoomPanel agents={agents} settings={settings} people={people} tasks={tasks.filter((task) => task.roomId === selectedRoom.id)} onAgentFailure={onAgentFailure} onAgentMessage={onAgentMessage} onCreateTask={onCreateTask} onCreateTasksFromRoom={onCreateTasksFromRoom} onDeleteRoom={onDeleteRoom} onSend={onSend} onUpdateMembers={onUpdateMembers} onUpdateRoles={onUpdateRoles} room={selectedRoom} /> : <EmptyState icon={UsersIcon} title="Create a workshop room" detail="Bring specialists together around a shared goal." />}
       </div>
     </div>
   );
 }
 
-function RoomPanel({ agents, people, room, tasks, onSend, onAgentFailure, onAgentMessage, onCreateTask, onCreateTasksFromRoom, onDeleteRoom, onUpdateMembers, onUpdateRoles }: { readonly agents: Agent[]; readonly people: Person[]; readonly room: Room; readonly tasks: Task[]; readonly onSend: (content: string) => void; readonly onAgentFailure: (roomId: string, agentId: string, detail: string) => void; readonly onAgentMessage: (roomId: string, agentId: string, content: string, repliedTo: RoomTurn) => void; readonly onCreateTask: () => void; readonly onCreateTasksFromRoom: (roomId: string) => void; readonly onDeleteRoom: (roomId: string) => void; readonly onUpdateMembers: (roomId: string, agentIds: string[], personIds: string[], invitedPeople: Person[]) => void; readonly onUpdateRoles: (roomId: string, roomRoles: Record<string, string>) => void }) {
+function RoomPanel({ agents, settings, people, room, tasks, onSend, onAgentFailure, onAgentMessage, onCreateTask, onCreateTasksFromRoom, onDeleteRoom, onUpdateMembers, onUpdateRoles }: { readonly agents: Agent[]; readonly settings: VaultSettings; readonly people: Person[]; readonly room: Room; readonly tasks: Task[]; readonly onSend: (content: string) => void; readonly onAgentFailure: (roomId: string, agentId: string, detail: string) => void; readonly onAgentMessage: (roomId: string, agentId: string, content: string, repliedTo: RoomTurn) => void; readonly onCreateTask: () => void; readonly onCreateTasksFromRoom: (roomId: string) => void; readonly onDeleteRoom: (roomId: string) => void; readonly onUpdateMembers: (roomId: string, agentIds: string[], personIds: string[], invitedPeople: Person[]) => void; readonly onUpdateRoles: (roomId: string, roomRoles: Record<string, string>) => void }) {
   const [draft, setDraft] = useState("");
   const [showRoles, setShowRoles] = useState(false);
   const [showMembers, setShowMembers] = useState(false);
@@ -1773,7 +1796,7 @@ function RoomPanel({ agents, people, room, tasks, onSend, onAgentFailure, onAgen
       <div className="border-t bg-card p-4">
         <div className="rounded-lg border bg-muted/20 p-2 focus-within:border-ring"><Textarea ref={textareaRef} className="min-h-16 resize-none border-0 bg-transparent p-2 shadow-none focus-visible:ring-0" onChange={(event) => { const value = event.currentTarget.value; setDraft(value); setMentionContext(findMentionContext(value, event.currentTarget.selectionStart)); }} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter") { event.preventDefault(); submit(); return; } if (mentionSuggestions.length > 0 && (event.key === "Enter" || event.key === "Tab")) { event.preventDefault(); insertMention(draft, mentionContext, mentionSuggestions[0], setDraft, setMentionContext, textareaRef); return; } if (event.key === "Escape" && mentionContext !== undefined) { event.preventDefault(); setMentionContext(undefined); return; } }} placeholder="Message the room… Use @ to mention someone" value={draft} />{mentionSuggestions.length > 0 ? <div className="mt-1 border-t px-1 pt-1"><p className="px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Mention someone</p><div className="grid gap-1 sm:grid-cols-2">{mentionSuggestions.slice(0, 8).map((target) => <button className="flex items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent" key={`${target.kind}:${target.id}`} onMouseDown={(event) => event.preventDefault()} onClick={() => insertMention(draft, mentionContext, target, setDraft, setMentionContext, textareaRef)} type="button"><span className={cn("flex size-6 items-center justify-center rounded-full text-[9px] font-semibold text-white", target.kind === "agent" ? avatarColor(target.role) : "bg-indigo-600")}>{initials(target.name)}</span><span className="min-w-0"><span className="block truncate text-xs font-medium">@{target.handle}</span><span className="block truncate text-[10px] text-muted-foreground">{target.name}{target.role ? ` · ${roleLabel(target.role)}` : " · Person"}</span></span></button>)}</div></div> : null}<div className="flex items-center justify-between px-2 pt-1"><span className="text-[11px] text-muted-foreground">{busyAgentIds.length > 0 ? `${busyAgentIds.length} agent${busyAgentIds.length === 1 ? " is" : "s are"} thinking…` : "⌘ Enter to send · @ mentions supported"}</span><Button disabled={draft.trim().length === 0} onClick={submit} size="sm">Send <ArrowRightIcon /></Button></div></div>
       </div>
-      {activeParticipants.map((agent) => <RoomAgentRunner agent={agent} key={`${room.id}:${agent.id}`} mentionTargets={mentionTargets} tasks={tasks} availableAgents={activeParticipants} onFailure={(detail) => onAgentFailure(room.id, agent.id, detail)} onMessage={(content, repliedTo) => { onAgentMessage(room.id, agent.id, content, repliedTo); if ((repliedTo.hop ?? 0) < 1 && mentionedRoomAgents(content, mentionTargets).some((id) => id !== agent.id)) setTurn({ id: `room-turn-${Date.now()}-${agent.id}`, content, author: agent.name, hop: 1 }); }} onStatus={(busy) => setAgentBusy(agent.id, busy)} room={room} turn={respondingParticipants.includes(agent) ? turn : undefined} />)}
+      {activeParticipants.map((agent) => <RoomAgentRunner agent={agent} settings={settings} key={`${room.id}:${agent.id}`} mentionTargets={mentionTargets} tasks={tasks} availableAgents={activeParticipants} onFailure={(detail) => onAgentFailure(room.id, agent.id, detail)} onMessage={(content, repliedTo) => { onAgentMessage(room.id, agent.id, content, repliedTo); if ((repliedTo.hop ?? 0) < 1 && mentionedRoomAgents(content, mentionTargets).some((id) => id !== agent.id)) setTurn({ id: `room-turn-${Date.now()}-${agent.id}`, content, author: agent.name, hop: 1 }); }} onStatus={(busy) => setAgentBusy(agent.id, busy)} room={room} turn={respondingParticipants.includes(agent) ? turn : undefined} />)}
     </div>
   );
 }
@@ -1807,7 +1830,7 @@ function RoomTranscriptDialog({ agents, people, room, open, onClose }: { readonl
   return <Dialog open={open} onOpenChange={(nextOpen) => !nextOpen && onClose()}><DialogContent className="max-h-[90vh] max-w-3xl"><DialogHeader><DialogTitle>Transcript · {room.name}</DialogTitle><DialogDescription>Everything currently recorded in this room, including agent replies and your messages.</DialogDescription></DialogHeader><div aria-label="Room transcript" className="max-h-[60vh] overflow-y-auto rounded-md border bg-muted/10 p-4"><pre className="whitespace-pre-wrap font-mono text-xs leading-5">{transcript}</pre></div><DialogFooter><Button onClick={onClose} variant="outline">Close</Button><Button onClick={copyTranscript} variant="outline"><CopyIcon />{copied ? "Copied" : "Copy transcript"}</Button><Button onClick={downloadTranscript}><FileDownIcon />Download Markdown</Button></DialogFooter></DialogContent></Dialog>;
 }
 
-function RoomAgentRunner({ agent, availableAgents, mentionTargets, tasks, onFailure, onMessage, onStatus, room, turn }: { readonly agent: Agent; readonly availableAgents: Agent[]; readonly mentionTargets: MentionTarget[]; readonly tasks: Task[]; readonly onFailure: (detail: string) => void; readonly onMessage: (content: string, repliedTo: RoomTurn) => void; readonly onStatus: (busy: boolean) => void; readonly room: Room; readonly turn?: RoomTurn }) {
+function RoomAgentRunner({ agent, settings, availableAgents, mentionTargets, tasks, onFailure, onMessage, onStatus, room, turn }: { readonly agent: Agent; readonly settings: VaultSettings; readonly availableAgents: Agent[]; readonly mentionTargets: MentionTarget[]; readonly tasks: Task[]; readonly onFailure: (detail: string) => void; readonly onMessage: (content: string, repliedTo: RoomTurn) => void; readonly onStatus: (busy: boolean) => void; readonly room: Room; readonly turn?: RoomTurn }) {
   const sentTurnId = useRef<string | undefined>(undefined);
   const reportedTurnId = useRef<string | undefined>(undefined);
   const inFlightTurn = useRef<RoomTurn | undefined>(undefined);
@@ -1843,20 +1866,27 @@ function RoomAgentRunner({ agent, availableAgents, mentionTargets, tasks, onFail
   useEffect(() => {
     if (!turn || sentTurnId.current === turn.id || inFlightTurn.current || eveAgent.status === "resuming") return;
     sentTurnId.current = turn.id;
+    let vaultModel: ReturnType<typeof resolveWorkspaceModel>;
+    try {
+      vaultModel = resolveWorkspaceModel(agent.model, settings);
+    } catch (error) {
+      onFailure(error instanceof Error ? error.message : "Choose a local model in Settings.");
+      return;
+    }
     inFlightTurn.current = turn;
     onStatus(true);
     void eveAgent.send(buildRoomPrompt(room, agent, mentionTargets, tasks, availableAgents, turn), {
       clientContext: JSON.stringify({
         vaultAgentId: agent.id,
         vaultAgent: agent,
-        vaultModel: getRoomModelContext(agent),
+        vaultModel,
       }),
     }).catch((error: unknown) => {
       inFlightTurn.current = undefined;
       onStatus(false);
       onFailure(error instanceof Error ? error.message : "The agent could not complete its room turn.");
     });
-  }, [agent, eveAgent, onFailure, onStatus, room, turn]);
+  }, [agent, eveAgent, onFailure, onStatus, room, settings, turn]);
 
   return null;
 }
@@ -1933,17 +1963,6 @@ function buildRoomTranscript(room: Room, agents: Agent[], people: Person[]): str
 
 function roomTranscriptFilename(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "room-transcript";
-}
-
-function getRoomModelContext(agent: Agent): { provider: "chatgpt" } | { provider: "ollama"; baseUrl: string; model: string } {
-  if (agent.model.startsWith("Ollama · ")) {
-    return {
-      provider: "ollama",
-      baseUrl: "http://127.0.0.1:11434",
-      model: agent.model.slice("Ollama · ".length),
-    };
-  }
-  return { provider: "chatgpt" };
 }
 
 function buildRoomPrompt(room: Room, agent: Agent, mentionTargets: MentionTarget[], tasks: Task[], availableAgents: Agent[], turn: RoomTurn): string {
@@ -2032,7 +2051,7 @@ function ActivityView({ activity, fileChanges, onRefresh }: { readonly activity:
 
 function ActivityRow({ item }: { readonly item: ActivityItem }) { const Icon = activityIcon(item.kind); return <div className="flex gap-4 px-5 py-4"><div className={cn("mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-lg", activityTone(item.kind))}><Icon className="size-4" /></div><div className="min-w-0 flex-1"><div className="flex flex-col justify-between gap-1 sm:flex-row sm:items-center"><p className="text-sm font-medium">{item.title}</p><span className="text-[11px] text-muted-foreground">{item.time}</span></div><FormattedAgentText className="mt-2 text-xs text-muted-foreground" compact content={item.detail} />{item.agent ? <Badge className="mt-3" variant="secondary">{item.agent}</Badge> : null}</div></div>; }
 
-function SettingsView({ loading, onSave, settings }: { readonly loading: boolean; readonly onSave: (settings: VaultSettings) => Promise<void>; readonly settings: VaultSettings }) {
+function SettingsView({ loading, localModels, modelsLoading, onSave, settings }: { readonly loading: boolean; readonly localModels: DiscoveredModel[]; readonly modelsLoading: boolean; readonly onSave: (settings: VaultSettings) => Promise<number>; readonly settings: VaultSettings }) {
   const [form, setForm] = useState(settings);
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<string>();
@@ -2040,11 +2059,12 @@ function SettingsView({ loading, onSave, settings }: { readonly loading: boolean
   const [checkingModel, setCheckingModel] = useState(false);
   const [modelCheck, setModelCheck] = useState<{ models: DiscoveredModel[]; error?: string }>();
   const modelCheckVersion = useRef(0);
+  const availableModels = modelCheck ? (modelCheck.error ? [] : modelCheck.models) : form.ollamaHost.trim() === settings.ollamaHost ? localModels : [];
 
   useEffect(() => setForm(settings), [settings]);
 
   const update = <K extends keyof VaultSettings>(key: K, value: VaultSettings[K]) => {
-    setForm((current) => ({ ...current, [key]: value }));
+    setForm((current) => ({ ...current, [key]: value, ...(key === "ollamaHost" ? { defaultOllamaModel: "" } : {}) }));
     setStatus(undefined);
     setError(undefined);
     if (key === "ollamaHost" || key === "defaultModel") {
@@ -2079,12 +2099,16 @@ function SettingsView({ loading, onSave, settings }: { readonly loading: boolean
 
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (form.defaultModel === "ollama" && !form.defaultOllamaModel) {
+      setError("Choose an installed Ollama model before saving. Use Check model if the list is empty.");
+      return;
+    }
     setSaving(true);
     setStatus(undefined);
     setError(undefined);
     try {
-      await onSave(form);
-      setStatus("Settings saved");
+      const updatedAgents = await onSave(form);
+      setStatus(updatedAgents > 0 ? `Settings saved · ${updatedAgents} agents switched for future work.` : "Settings saved");
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : "Settings could not be saved.");
     } finally {
@@ -2103,12 +2127,17 @@ function SettingsView({ loading, onSave, settings }: { readonly loading: boolean
       <SettingsCard title="Appearance" description="Choose a comfortable contrast for this browser. Your choice is remembered locally.">
         <ThemeSwitcher showLabel />
       </SettingsCard>
-      <SettingsCard title="Model defaults" description="Select the provider used as the starting point for new work.">
+      <SettingsCard title="Model defaults" description="Choose the model for all agents and future work.">
         <label className="space-y-2 text-sm font-medium" htmlFor="default-model">Default model provider<select className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" id="default-model" onChange={(event) => update("defaultModel", event.currentTarget.value as VaultSettings["defaultModel"])} value={form.defaultModel}><option value="chatgpt-subscription">ChatGPT subscription</option><option value="ollama">Ollama local</option></select></label>
         <label className="space-y-2 text-sm font-medium" htmlFor="ollama-host">Ollama address<Input id="ollama-host" onChange={(event) => update("ollamaHost", event.currentTarget.value)} value={form.ollamaHost} /></label>
+        {form.defaultModel === "ollama" ? <label className="space-y-2 text-sm font-medium" htmlFor="default-ollama-model">Local model<select className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" id="default-ollama-model" onChange={(event) => update("defaultOllamaModel", event.currentTarget.value)} value={form.defaultOllamaModel}>
+          <option value="">{modelsLoading ? "Scanning installed models…" : "Choose an installed model"}</option>
+          {form.defaultOllamaModel && !availableModels.some((model) => model.id === form.defaultOllamaModel) ? <option disabled value={form.defaultOllamaModel}>{form.defaultOllamaModel} · unavailable</option> : null}
+          {availableModels.map((model) => <option key={model.id} value={model.id}>{model.name}{model.details ? ` · ${model.details}` : ""}</option>)}
+        </select></label> : null}
         <p className="text-xs leading-5 text-muted-foreground">The Ollama address is used when local model discovery and execution are enabled.</p>
         <Button disabled={checkingModel} onClick={checkModel} type="button" variant="outline"><RefreshCwIcon className={cn(checkingModel && "animate-spin")} />{checkingModel ? "Checking…" : "Check model"}</Button>
-        <p className="text-xs leading-5 text-muted-foreground">Checks this address and lists installed models without generating text. Save settings to use a new address in chat.</p>
+        <p className="text-xs leading-5 text-muted-foreground">Check this address without generating text, choose a local model, then save. A model change updates every agent for new chats and future task attempts; runs already in progress keep their current model.</p>
         {modelCheck ? <div aria-live="polite" className={cn("rounded-md border p-3 text-sm", modelCheck.error ? "border-destructive/40 text-destructive" : "border-emerald-600/40 text-emerald-800 dark:text-emerald-300")} role="status">
           {modelCheck.error ? modelCheck.error : modelCheck.models.length === 0 ? "Ollama is connected, but no models are installed." : `Ollama is connected · ${modelCheck.models.length} local model${modelCheck.models.length === 1 ? "" : "s"} found.`}
           {modelCheck.models.length > 0 ? <ul className="mt-2 list-inside list-disc text-foreground">{modelCheck.models.map((model) => <li key={model.id}>{model.name}{model.details ? ` · ${model.details}` : ""}</li>)}</ul> : null}
@@ -2211,18 +2240,21 @@ function WorkspaceDialog({ open, onClose, onSelected }: { readonly open: boolean
   return <Dialog open={open} onOpenChange={(nextOpen) => !nextOpen && onClose()}><DialogContent className="flex max-h-[min(80vh,700px)] flex-col sm:max-w-xl"><DialogHeader><DialogTitle className="flex items-center gap-2"><FolderOpenIcon className="size-5 text-muted-foreground" /> Choose local workspace folder</DialogTitle><DialogDescription>Agent Vault stores shared artifacts in the folder you select. Browse folders inside this project and choose the location that should hold the vault files.</DialogDescription></DialogHeader><div className="min-h-0 space-y-4 overflow-y-auto"><div className="rounded-lg border bg-muted/20 p-3"><p className="text-xs font-medium">Project root</p><p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">{rootPath || "Loading…"}</p></div><div className="flex items-center justify-between gap-3"><div className="min-w-0"><p className="text-xs font-medium">Browsing</p><p className="truncate font-mono text-xs text-muted-foreground">{currentPath === "." ? "Project root" : currentPath}</p></div><div className="flex shrink-0 gap-2">{parentPath ? <Button onClick={() => browse(parentPath)} size="sm" variant="outline">Up</Button> : null}<Button disabled={currentPath === "."} onClick={() => browse(".")} size="sm" variant="ghost">Project root</Button></div></div>{error ? <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">{error}</div> : null}<div className="min-h-40 rounded-lg border">{loading ? <p className="p-4 text-sm text-muted-foreground">Loading folders…</p> : entries.length > 0 ? <div className="divide-y">{entries.map((entry) => <button className="flex w-full items-center gap-3 px-3 py-2.5 text-left text-sm hover:bg-accent" key={entry.relativePath} onClick={() => browse(entry.relativePath)} type="button"><FolderOpenIcon className="size-4 text-muted-foreground" /><span className="truncate">{entry.name}</span><ChevronRightIcon className="ml-auto size-4 text-muted-foreground" /></button>)}</div> : <p className="p-4 text-sm text-muted-foreground">No subfolders here. This folder can still be used for artifacts.</p>}</div><p className="text-xs leading-5 text-muted-foreground">Selected folder: <span className="font-medium text-foreground">{currentPath === "." ? "Project root" : currentPath}</span>. Agent sandbox files remain isolated by EVE; this setting controls Agent Vault’s local artifact storage.</p></div><DialogFooter><a className="mr-auto inline-flex items-center gap-2 rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-accent hover:text-foreground" download href="/api/vault/export"><FileDownIcon className="size-4" /> Export vault</a><Button onClick={onClose} variant="outline">Cancel</Button><Button disabled={loading || selecting} onClick={selectFolder}><FolderOpenIcon />{selecting ? "Selecting…" : "Use this folder"}</Button></DialogFooter></DialogContent></Dialog>;
 }
 
-function SpawnerDialog({ open, onClose, onCreate, localModels, modelsLoading }: { readonly open: boolean; readonly onClose: () => void; readonly onCreate: (agent: Agent) => void; readonly localModels: DiscoveredModel[]; readonly modelsLoading: boolean }) {
+function SpawnerDialog({ open, onClose, onCreate, localModels, modelsLoading, settings }: { readonly open: boolean; readonly onClose: () => void; readonly onCreate: (agent: Agent) => void; readonly localModels: DiscoveredModel[]; readonly modelsLoading: boolean; readonly settings: VaultSettings }) {
   const [name, setName] = useState("");
   const [job, setJob] = useState("");
   const [role, setRole] = useState<Role>("custom");
   const [model, setModel] = useState("ChatGPT subscription");
+  useEffect(() => {
+    if (open) setModel(settings.defaultModel === "ollama" ? settings.defaultOllamaModel ? `Ollama · ${settings.defaultOllamaModel}` : "" : "ChatGPT subscription");
+  }, [open, settings.defaultModel, settings.defaultOllamaModel]);
   const [context, setContext] = useState("Work from the shared room context and report decisions clearly.");
   const [tools, setTools] = useState(["Artifacts", "Task board"]);
   const [permissions, setPermissions] = useState(["Read workspace"]);
   const [allowedFolders, setAllowedFolders] = useState(".");
   const toggle = (value: string, current: string[], setCurrent: (value: string[]) => void) => setCurrent(current.includes(value) ? current.filter((item) => item !== value) : [...current, value]);
-  const create = () => { const cleanName = name.trim(); if (!cleanName) return; const folders = allowedFolders.split(",").map((folder) => folder.trim()).filter(Boolean); if (folders.length === 0 || folders.some((folder) => folder !== "." && (folder.startsWith("/") || /^[a-zA-Z]:/u.test(folder) || folder.includes("\\") || folder.split("/").some((part) => !part || part.startsWith("."))))) { window.alert("Use folders inside the selected workspace, such as docs, src, or . for the whole folder."); return; } onCreate({ id: `custom-${Date.now()}`, name: cleanName, role, description: job.trim() || context, capabilities: [roleLabel(role).toLowerCase(), "shared context", "focused execution"], model, tools, permissions, allowedFolders: folders, context, status: "idle" }); setName(""); setJob(""); };
-  return <Dialog open={open} onOpenChange={(nextOpen) => !nextOpen && onClose()}><DialogContent className="max-w-2xl"><DialogHeader><DialogTitle>Spawn an agent</DialogTitle><DialogDescription>Configure a focused specialist for a job, room, or task.</DialogDescription></DialogHeader><div className="grid gap-5 sm:grid-cols-2"><div className="space-y-4"><Field label="Agent name"><Input onChange={(event) => setName(event.currentTarget.value)} placeholder="e.g. Competitor Scout" value={name} /></Field><Field label="Job / mission"><Input onChange={(event) => setJob(event.currentTarget.value)} placeholder="What should this agent accomplish?" value={job} /></Field><Field label="Role"><select className="h-9 w-full rounded-md border bg-transparent px-3 text-sm" onChange={(event) => setRole(event.currentTarget.value as Role)} value={role}>{["custom", "lead", "researcher", "planner", "writer", "reviewer"].map((value) => <option key={value} value={value}>{roleLabel(value as Role)}</option>)}</select></Field><Field label="Model"><select className="h-9 w-full rounded-md border bg-transparent px-3 text-sm" onChange={(event) => setModel(event.currentTarget.value)} value={model}><option>ChatGPT subscription</option>{localModels.length > 0 ? <optgroup label="Ollama · local">{localModels.map((localModel) => <option key={localModel.id} value={`Ollama · ${localModel.id}`}>{localModel.name}{localModel.details ? ` · ${localModel.details}` : ""}</option>)}</optgroup> : <option disabled>{modelsLoading ? "Scanning for Ollama…" : "Ollama offline"}</option>}<option>Choose after spawning</option></select></Field><Field label="Working context"><Textarea className="min-h-24" onChange={(event) => setContext(event.currentTarget.value)} value={context} /></Field></div><div className="space-y-4"><ChoiceGroup label="Tools" values={["Artifacts", "Task board", "Web search", "File workspace", "Workflow"]} selected={tools} onToggle={(value) => toggle(value, tools, setTools)} /><ChoiceGroup label="Permissions" values={["Read workspace", "Write workspace", "Create tasks", "Edit artifacts", "External actions"]} selected={permissions} onToggle={(value) => toggle(value, permissions, setPermissions)} /><Field label="Allowed folders inside selected workspace"><Input aria-label="Allowed workspace folders" onChange={(event) => setAllowedFolders(event.currentTarget.value)} placeholder="., docs, src" value={allowedFolders} /><p className="mt-1 text-xs text-muted-foreground">Comma-separated. “.” allows the selected folder; narrower paths limit file access.</p></Field><div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-900"><div className="flex items-center gap-2 font-medium"><ShieldCheckIcon className="size-4" />Safety defaults are on</div><p className="mt-1 text-amber-800/80">Host files are available only to active assigned tasks with the File workspace tool and matching permissions. Test scripts require approval.</p></div></div></div><DialogFooter><Button onClick={onClose} variant="outline">Cancel</Button><Button disabled={name.trim().length === 0} onClick={create}><SparklesIcon /> Spawn agent</Button></DialogFooter></DialogContent></Dialog>;
+  const create = () => { const cleanName = name.trim(); if (!cleanName || !model) return; const folders = allowedFolders.split(",").map((folder) => folder.trim()).filter(Boolean); if (folders.length === 0 || folders.some((folder) => folder !== "." && (folder.startsWith("/") || /^[a-zA-Z]:/u.test(folder) || folder.includes("\\") || folder.split("/").some((part) => !part || part.startsWith("."))))) { window.alert("Use folders inside the selected workspace, such as docs, src, or . for the whole folder."); return; } onCreate({ id: `custom-${Date.now()}`, name: cleanName, role, description: job.trim() || context, capabilities: [roleLabel(role).toLowerCase(), "shared context", "focused execution"], model, tools, permissions, allowedFolders: folders, context, status: "idle" }); setName(""); setJob(""); };
+  return <Dialog open={open} onOpenChange={(nextOpen) => !nextOpen && onClose()}><DialogContent className="max-w-2xl"><DialogHeader><DialogTitle>Spawn an agent</DialogTitle><DialogDescription>Configure a focused specialist for a job, room, or task.</DialogDescription></DialogHeader><div className="grid gap-5 sm:grid-cols-2"><div className="space-y-4"><Field label="Agent name"><Input onChange={(event) => setName(event.currentTarget.value)} placeholder="e.g. Competitor Scout" value={name} /></Field><Field label="Job / mission"><Input onChange={(event) => setJob(event.currentTarget.value)} placeholder="What should this agent accomplish?" value={job} /></Field><Field label="Role"><select className="h-9 w-full rounded-md border bg-transparent px-3 text-sm" onChange={(event) => setRole(event.currentTarget.value as Role)} value={role}>{["custom", "lead", "researcher", "planner", "writer", "reviewer"].map((value) => <option key={value} value={value}>{roleLabel(value as Role)}</option>)}</select></Field><Field label="Model"><select className="h-9 w-full rounded-md border bg-transparent px-3 text-sm" onChange={(event) => setModel(event.currentTarget.value)} value={model}>{model === "" ? <option disabled value="">Choose a local model</option> : null}<option disabled={settings.defaultModel === "ollama"}>ChatGPT subscription</option>{localModels.length > 0 ? <optgroup label="Ollama · local">{localModels.map((localModel) => <option key={localModel.id} value={`Ollama · ${localModel.id}`}>{localModel.name}{localModel.details ? ` · ${localModel.details}` : ""}</option>)}</optgroup> : <option disabled>{modelsLoading ? "Scanning for Ollama…" : "Ollama offline"}</option>}</select></Field><Field label="Working context"><Textarea className="min-h-24" onChange={(event) => setContext(event.currentTarget.value)} value={context} /></Field></div><div className="space-y-4"><ChoiceGroup label="Tools" values={["Artifacts", "Task board", "Web search", "File workspace", "Workflow"]} selected={tools} onToggle={(value) => toggle(value, tools, setTools)} /><ChoiceGroup label="Permissions" values={["Read workspace", "Write workspace", "Create tasks", "Edit artifacts", "External actions"]} selected={permissions} onToggle={(value) => toggle(value, permissions, setPermissions)} /><Field label="Allowed folders inside selected workspace"><Input aria-label="Allowed workspace folders" onChange={(event) => setAllowedFolders(event.currentTarget.value)} placeholder="., docs, src" value={allowedFolders} /><p className="mt-1 text-xs text-muted-foreground">Comma-separated. “.” allows the selected folder; narrower paths limit file access.</p></Field><div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-900"><div className="flex items-center gap-2 font-medium"><ShieldCheckIcon className="size-4" />Safety defaults are on</div><p className="mt-1 text-amber-800/80">Host files are available only to active assigned tasks with the File workspace tool and matching permissions. Test scripts require approval.</p></div></div></div><DialogFooter><Button onClick={onClose} variant="outline">Cancel</Button><Button disabled={name.trim().length === 0 || !model} onClick={create}><SparklesIcon /> Spawn agent</Button></DialogFooter></DialogContent></Dialog>;
 }
 
 function RoomMembersDialog({ open, onClose, onSave, agents, people, selectedAgentIds, selectedPersonIds }: { readonly open: boolean; readonly onClose: () => void; readonly onSave: (agentIds: string[], personIds: string[], invitedPeople: Person[]) => void; readonly agents: Agent[]; readonly people: Person[]; readonly selectedAgentIds: string[]; readonly selectedPersonIds: string[] }) {

@@ -3,7 +3,7 @@
 import type { UserContent } from "ai";
 import { useEveAgent } from "eve/react";
 import { AlertCircleIcon, ArrowLeftIcon, BrainIcon, PlusIcon, RefreshCwIcon, SquareIcon } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Conversation,
   ConversationContent,
@@ -25,6 +25,7 @@ import { cn } from "@/lib/utils";
 import { AgentMessage } from "./agent-message";
 import { ThemeSwitcher } from "./theme-provider";
 import { CHATGPT_MODEL_ID, resolveChatModelSelection } from "@/agent/lib/chat-model-selection";
+import { resolveWorkspaceModel, type WorkspaceModelSettings } from "@/agent/lib/workspace-model";
 
 const AGENT_NAME = "Agent Vault";
 const MODEL_SELECTION_KEY = "agent-vault-model";
@@ -89,19 +90,47 @@ export function AgentChat({
   const [modelDiscoveryError, setModelDiscoveryError] = useState<string>();
   const [modelSelectionError, setModelSelectionError] = useState<string>();
   const [modelScanVersion, setModelScanVersion] = useState(0);
+  const [modelSelectionReady, setModelSelectionReady] = useState(false);
+  const [localOnly, setLocalOnly] = useState(false);
+  const modelChosenInChat = useRef(false);
 
   useEffect(() => {
     setSelectedModelId(loadSavedModelId());
     const agents = loadVaultAgents();
     setVaultAgents(agents);
     if (initialAgentId === undefined) setSelectedAgentId("coordinator");
-    void fetch("/api/agents", { cache: "no-store" })
-      .then(async (response) => response.ok ? await response.json() as { agents?: VaultAgent[] } : null)
-      .then((payload) => {
-        if (!payload || !Array.isArray(payload.agents)) return;
-        setVaultAgents((current) => [...payload.agents!.filter((agent) => !current.some((item) => item.id === agent.id)), ...current]);
-      })
-      .catch(() => undefined);
+    let cancelled = false;
+    void Promise.all([
+      fetch("/api/agents", { cache: "no-store" }),
+      fetch("/api/settings", { cache: "no-store" }),
+    ]).then(async ([agentsResponse, settingsResponse]) => {
+      if (!settingsResponse.ok) throw new Error("Model settings could not be loaded. No model request was sent.");
+      const agentPayload = agentsResponse.ok ? await agentsResponse.json() as { agents?: VaultAgent[] } : null;
+      const settingsPayload = await settingsResponse.json() as { settings?: WorkspaceModelSettings };
+      if (!settingsPayload.settings) throw new Error("Model settings could not be loaded. No model request was sent.");
+      if (cancelled) return;
+      setLocalOnly(settingsPayload.settings.defaultModel === "ollama");
+      if (settingsPayload.settings.defaultModel === "ollama" && modelChosenInChat.current) {
+        setSelectedModelId((current) => current === CHATGPT_MODEL_ID ? "" : current);
+      }
+      const currentAgents = Array.isArray(agentPayload?.agents) ? agentPayload.agents : agents;
+      setVaultAgents(currentAgents);
+      if (!modelChosenInChat.current) {
+        try {
+          const profile = currentAgents.find((agent) => agent.id === initialAgentId);
+          const model = resolveWorkspaceModel(profile?.model ?? "ChatGPT subscription", settingsPayload.settings);
+          setSelectedModelId(model.provider === "ollama" ? model.model : CHATGPT_MODEL_ID);
+          setModelSelectionError(undefined);
+        } catch (error) {
+          setSelectedModelId("");
+          setModelSelectionError(error instanceof Error ? error.message : "Choose a local model in Settings.");
+        }
+      }
+      setModelSelectionReady(true);
+    }).catch((error: unknown) => {
+      if (!cancelled) setModelSelectionError(error instanceof Error ? error.message : "Model settings could not be loaded.");
+    });
+    return () => { cancelled = true; };
   }, [initialAgentId]);
 
   useEffect(() => {
@@ -137,6 +166,8 @@ export function AgentChat({
   }, [modelScanVersion]);
 
   const changeModel = (modelId: string) => {
+    if (localOnly && modelId === CHATGPT_MODEL_ID) return;
+    modelChosenInChat.current = true;
     setSelectedModelId(modelId);
     setModelSelectionError(undefined);
     try {
@@ -218,6 +249,14 @@ export function AgentChat({
   const handleSubmit = async (message: PromptInputMessage) => {
     const text = message.text.trim();
     if ((text.length === 0 && message.files.length === 0) || isResuming) return;
+    if (!modelSelectionReady) {
+      setModelSelectionError("Model settings are still loading. No model request was sent.");
+      return;
+    }
+    if (localOnly && selectedModelId === CHATGPT_MODEL_ID) {
+      setModelSelectionError("This workspace is set to Ollama. Choose a local model in Settings. No ChatGPT request was sent.");
+      return;
+    }
     const vaultModel = resolveChatModelSelection(selectedModelId, localModels);
     if (!vaultModel) {
       setModelSelectionError("That local model is not available. Start Ollama and rescan, or choose another model. No ChatGPT request was sent.");
@@ -291,6 +330,7 @@ export function AgentChat({
           onRescanModels={() => setModelScanVersion((current) => current + 1)}
           selectedAgentId={selectedAgentId}
           selectedModelId={selectedModelId}
+          localOnly={localOnly}
         />
       ) : null}
 
@@ -349,7 +389,7 @@ export function AgentChat({
           <div className="flex justify-center">
             <div className="flex flex-wrap justify-center gap-3">
               <AgentPicker agents={vaultAgents} onChange={changeAgent} selectedAgentId={selectedAgentId} />
-              <ModelPicker error={modelDiscoveryError} localModels={localModels} loading={modelsLoading} onChange={changeModel} onRescan={() => setModelScanVersion((current) => current + 1)} selectedModelId={selectedModelId} />
+              <ModelPicker error={modelDiscoveryError} localModels={localModels} loading={modelsLoading} localOnly={localOnly} onChange={changeModel} onRescan={() => setModelScanVersion((current) => current + 1)} selectedModelId={selectedModelId} />
             </div>
           </div>
         )}
@@ -419,6 +459,7 @@ function ChatHeader({
   onRescanModels,
   selectedAgentId,
   selectedModelId,
+  localOnly,
 }: {
   readonly agents: VaultAgent[];
   readonly canStartNewChat: boolean;
@@ -430,6 +471,7 @@ function ChatHeader({
   readonly onRescanModels: () => void;
   readonly selectedAgentId: string;
   readonly selectedModelId: string;
+  readonly localOnly: boolean;
 }) {
   return (
     <header className="pointer-events-none fixed top-0 right-0 left-0 z-20 h-14">
@@ -437,7 +479,7 @@ function ChatHeader({
         <span className="truncate text-muted-foreground text-sm">{agents.find((agent) => agent.id === selectedAgentId)?.name ?? AGENT_NAME}</span>
         <div className="pointer-events-auto absolute top-2 left-24 hidden items-center gap-3 sm:flex lg:left-32">
           <AgentPicker agents={agents} onChange={onAgentChange} selectedAgentId={selectedAgentId} />
-          <ModelPicker error={modelDiscoveryError} localModels={localModels} loading={modelsLoading} onChange={onModelChange} onRescan={onRescanModels} selectedModelId={selectedModelId} />
+          <ModelPicker error={modelDiscoveryError} localModels={localModels} loading={modelsLoading} localOnly={localOnly} onChange={onModelChange} onRescan={onRescanModels} selectedModelId={selectedModelId} />
         </div>
         <div className="pointer-events-auto absolute top-3 right-32">
           <ThemeSwitcher />
@@ -471,6 +513,7 @@ function ModelPicker({
   onChange,
   onRescan,
   selectedModelId,
+  localOnly,
 }: {
   readonly error?: string;
   readonly localModels: LocalModel[];
@@ -478,8 +521,9 @@ function ModelPicker({
   readonly onChange: (modelId: string) => void;
   readonly onRescan: () => void;
   readonly selectedModelId: string;
+  readonly localOnly: boolean;
 }) {
-  const selectedMissing = selectedModelId !== CHATGPT_MODEL_ID && !localModels.some((model) => model.id === selectedModelId);
+  const selectedMissing = selectedModelId !== "" && selectedModelId !== CHATGPT_MODEL_ID && !localModels.some((model) => model.id === selectedModelId);
   return (
     <label className="flex items-center gap-2 text-muted-foreground text-xs">
       <span className="hidden md:inline">Model</span>
@@ -489,7 +533,8 @@ function ModelPicker({
         onChange={(event) => onChange(event.currentTarget.value)}
         value={selectedModelId}
       >
-        <option value={CHATGPT_MODEL_ID}>ChatGPT subscription</option>
+        {selectedModelId === "" ? <option disabled value="">Choose local model in Settings</option> : null}
+        <option disabled={localOnly} value={CHATGPT_MODEL_ID}>ChatGPT subscription</option>
         {selectedMissing ? <option disabled value={selectedModelId}>{selectedModelId} · unavailable</option> : null}
         {localModels.length > 0 ? (
           <optgroup label="Ollama · local">

@@ -16,7 +16,9 @@ export type VaultModelSelection =
 
 const CLIENT_CONTEXT_PREFIX = "Client context:\n";
 const DELEGATED_MODEL_PREFIX = "Agent Vault model selection: ";
-const LOCAL_HOST_PATTERN = /^(localhost|127\.0\.0\.1|::1)$/u;
+const LOCAL_HOST_PATTERN = /^(localhost|127\.0\.0\.1|\[::1\])$/u;
+
+export class InvalidLocalModelSelectionError extends Error {}
 
 export function parseVaultModelSelection(
   messages: readonly ModelMessage[],
@@ -44,21 +46,24 @@ export function parseVaultModelSelection(
         const selection = parsed.vaultModel;
         if (selection.provider === "chatgpt") return DEFAULT_MODEL_SELECTION;
 
-        if (
-          selection.provider === "ollama" &&
-          typeof selection.baseUrl === "string" &&
-          typeof selection.model === "string" &&
-          isLocalHttpUrl(selection.baseUrl) &&
-          selection.model.length > 0 &&
-          selection.model.length <= 200
-        ) {
-          return {
-            provider: "ollama",
-            baseUrl: selection.baseUrl.replace(/\/$/u, ""),
-            model: selection.model,
-          };
+        if (selection.provider === "ollama") {
+          if (
+            typeof selection.baseUrl === "string" &&
+            typeof selection.model === "string" &&
+            isLocalHttpUrl(selection.baseUrl) &&
+            selection.model.length > 0 &&
+            selection.model.length <= 200
+          ) {
+            return {
+              provider: "ollama",
+              baseUrl: selection.baseUrl.replace(/\/$/u, ""),
+              model: selection.model,
+            };
+          }
+          throw new InvalidLocalModelSelectionError("The local model selection is invalid. No ChatGPT request was sent.");
         }
-      } catch {
+      } catch (error) {
+        if (error instanceof InvalidLocalModelSelectionError) throw error;
         // Ignore ordinary conversation text that resembles the marker.
       }
     }
@@ -75,6 +80,7 @@ export function isLocalHttpUrl(value: string): boolean {
       LOCAL_HOST_PATTERN.test(url.hostname) &&
       url.username === "" &&
       url.password === "" &&
+      url.pathname === "/" &&
       url.search === "" &&
       url.hash === ""
     );

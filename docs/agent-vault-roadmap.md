@@ -331,6 +331,15 @@ Implementation record:
     The check accepts loopback addresses only. Verified 45 unit checks,
     TypeScript, production build, and live success/invalid-address UI states;
     no saved setting or model run was changed.
+11. Connected the saved workspace model to existing agents, new agents, room
+    conversations, direct chats, and task execution. Settings now requires a
+    concrete installed Ollama model before applying a local default; the save
+    updates all agent profiles and registry records in one database transaction
+    without altering tasks. Incomplete local setup blocks work instead of
+    falling back to ChatGPT. Verified 50 unit/SQLite checks, TypeScript, a
+    production build, and live Settings, Agent Library, and chat states. No
+    model generation request or user-data migration was triggered during UI
+    verification.
 
 ### Phase 6 — Verification and quality control
 
