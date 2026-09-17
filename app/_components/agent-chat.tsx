@@ -345,8 +345,8 @@ export function AgentChat({
               : `eve:web-chat-scroll:${activeSessionId}`
           }
         >
-          <ConversationTopFade className="top-14" />
-          <ConversationContent className="mx-auto w-full max-w-3xl gap-6 px-4 pt-20 pb-36 sm:px-6">
+          <ConversationTopFade className="top-24 sm:top-14" />
+          <ConversationContent className="mx-auto w-full max-w-3xl gap-6 px-4 pt-28 pb-36 sm:px-6 sm:pt-20">
             {agent.data.messages.map((message, index) =>
               showPendingThinking &&
               isPendingAssistantShell &&
@@ -474,20 +474,19 @@ function ChatHeader({
   readonly localOnly: boolean;
 }) {
   return (
-    <header className="pointer-events-none fixed top-0 right-0 left-0 z-20 h-14">
-      <div className="relative mx-auto flex h-full w-full max-w-3xl items-center justify-center bg-background px-24">
-        <span className="truncate text-muted-foreground text-sm">{agents.find((agent) => agent.id === selectedAgentId)?.name ?? AGENT_NAME}</span>
-        <div className="pointer-events-auto absolute top-2 left-24 hidden items-center gap-3 sm:flex lg:left-32">
+    <header className="fixed inset-x-0 top-0 z-20 border-b bg-background">
+      <div className="mx-auto flex max-w-5xl justify-center px-4 pt-14 pb-2 sm:h-14 sm:items-center sm:px-32 sm:py-0">
+        <div className="flex min-w-0 items-center justify-center gap-2">
           <AgentPicker agents={agents} onChange={onAgentChange} selectedAgentId={selectedAgentId} />
           <ModelPicker error={modelDiscoveryError} localModels={localModels} loading={modelsLoading} localOnly={localOnly} onChange={onModelChange} onRescan={onRescanModels} selectedModelId={selectedModelId} />
         </div>
-        <div className="pointer-events-auto absolute top-3 right-32">
+        <div className={cn("fixed top-3", canStartNewChat ? "right-20 sm:right-36" : "right-4")}>
           <ThemeSwitcher />
         </div>
         {canStartNewChat ? (
           <Button
             aria-label="Start a new chat"
-            className="pointer-events-auto fixed top-3 right-6 pr-4"
+            className="fixed top-3 right-3 sm:right-6 sm:pr-4"
             onClick={() => window.location.assign(selectedAgentId === "coordinator" ? "/s" : `/s?agentId=${encodeURIComponent(selectedAgentId)}`)}
             size="sm"
             type="button"
@@ -503,7 +502,7 @@ function ChatHeader({
 }
 
 function AgentPicker({ agents, onChange, selectedAgentId }: { readonly agents: VaultAgent[]; readonly onChange: (agentId: string) => void; readonly selectedAgentId: string }) {
-  return <label className="flex items-center gap-2 text-muted-foreground text-xs"><span className="hidden xl:inline">Agent</span><select aria-label="Select agent" className="max-w-48 rounded-md border border-input bg-background px-2 py-1.5 text-foreground text-xs outline-none transition-colors hover:bg-accent focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/40" onChange={(event) => onChange(event.currentTarget.value)} value={selectedAgentId}><option value="coordinator">Agent Vault · coordinator</option>{agents.length > 0 ? <optgroup label="Created agents">{agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name} · {formatAgentRole(agent.role)}</option>)}</optgroup> : null}</select></label>;
+  return <label className="flex min-w-0 items-center gap-2 text-muted-foreground text-xs"><span className="hidden xl:inline">Agent</span><select aria-label="Select agent" className="w-28 min-w-0 rounded-md border border-input bg-background px-2 py-1.5 text-foreground text-xs outline-none transition-colors hover:bg-accent focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/40 sm:w-40 lg:w-44" onChange={(event) => onChange(event.currentTarget.value)} value={selectedAgentId}><option value="coordinator">Agent Vault · coordinator</option>{agents.length > 0 ? <optgroup label="Created agents">{agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name} · {formatAgentRole(agent.role)}</option>)}</optgroup> : null}</select></label>;
 }
 
 function ModelPicker({
@@ -525,11 +524,11 @@ function ModelPicker({
 }) {
   const selectedMissing = selectedModelId !== "" && selectedModelId !== CHATGPT_MODEL_ID && !localModels.some((model) => model.id === selectedModelId);
   return (
-    <label className="flex items-center gap-2 text-muted-foreground text-xs">
+    <label className="flex min-w-0 items-center gap-2 text-muted-foreground text-xs">
       <span className="hidden md:inline">Model</span>
       <select
         aria-label="Select model"
-        className="max-w-44 rounded-md border border-input bg-background px-2 py-1.5 text-foreground text-xs outline-none transition-colors hover:bg-accent focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/40"
+        className="w-28 min-w-0 rounded-md border border-input bg-background px-2 py-1.5 text-foreground text-xs outline-none transition-colors hover:bg-accent focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/40 sm:w-40 lg:w-44"
         onChange={(event) => onChange(event.currentTarget.value)}
         value={selectedModelId}
       >
@@ -547,7 +546,7 @@ function ModelPicker({
           </optgroup>
         ) : null}
       </select>
-      <button aria-label="Rescan local models" className="rounded-md border border-input p-1.5 text-foreground hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring" disabled={loading} onClick={onRescan} title="Rescan local models" type="button"><RefreshCwIcon className={cn("size-3.5", loading && "animate-spin")} /></button>
+      <button aria-label="Rescan local models" className="shrink-0 rounded-md border border-input p-1.5 text-foreground hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring" disabled={loading} onClick={onRescan} title="Rescan local models" type="button"><RefreshCwIcon className={cn("size-3.5", loading && "animate-spin")} /></button>
       <span aria-live="polite" className="hidden text-muted-foreground lg:inline" title={error}>
         {loading ? "Scanning…" : error ? "Ollama unavailable" : localModels.length > 0 ? `${localModels.length} local` : "No local models"}
       </span>

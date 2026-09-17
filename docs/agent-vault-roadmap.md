@@ -340,6 +340,14 @@ Implementation record:
     production build, and live Settings, Agent Library, and chat states. No
     model generation request or user-data migration was triggered during UI
     verification.
+12. Reworked the direct-chat header after a user screenshot showed the agent
+    name overlapping the agent/model controls. The duplicate centered name was
+    removed; selectors now share a normal layout row, with a separate control
+    row on narrow screens and bounded select widths. TypeScript and 50 unit
+    checks passed, and the running development UI exposed both accessible
+    selectors without the duplicate text. Production build verification remains
+    pending: both Turbopack and webpack stalled during compilation in this
+    checkout without reporting a source error.
 
 ### Phase 6 — Verification and quality control
 
