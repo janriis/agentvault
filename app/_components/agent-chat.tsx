@@ -2,7 +2,7 @@
 
 import type { UserContent } from "ai";
 import { useEveAgent } from "eve/react";
-import { AlertCircleIcon, BrainIcon, PlusIcon, RefreshCwIcon, SquareIcon } from "lucide-react";
+import { AlertCircleIcon, ArrowLeftIcon, BrainIcon, PlusIcon, RefreshCwIcon, SquareIcon } from "lucide-react";
 import { useEffect, useState } from "react";
 import {
   Conversation,
@@ -276,6 +276,9 @@ export function AgentChat({
 
   return (
     <main className="flex h-dvh flex-col overflow-hidden bg-background text-foreground">
+      <Button asChild className="fixed top-3 left-4 z-30" size="sm" variant="ghost">
+        <a aria-label="Back to Agent Vault" href="/"><ArrowLeftIcon className="size-4" /> <span className="hidden sm:inline">Back to vault</span></a>
+      </Button>
       {showConversationLayout ? (
         <ChatHeader
           canStartNewChat={activeSessionId !== undefined}
@@ -432,7 +435,7 @@ function ChatHeader({
     <header className="pointer-events-none fixed top-0 right-0 left-0 z-20 h-14">
       <div className="relative mx-auto flex h-full w-full max-w-3xl items-center justify-center bg-background px-24">
         <span className="truncate text-muted-foreground text-sm">{agents.find((agent) => agent.id === selectedAgentId)?.name ?? AGENT_NAME}</span>
-        <div className="pointer-events-auto absolute top-2 left-6 hidden items-center gap-3 sm:flex">
+        <div className="pointer-events-auto absolute top-2 left-24 hidden items-center gap-3 sm:flex lg:left-32">
           <AgentPicker agents={agents} onChange={onAgentChange} selectedAgentId={selectedAgentId} />
           <ModelPicker error={modelDiscoveryError} localModels={localModels} loading={modelsLoading} onChange={onModelChange} onRescan={onRescanModels} selectedModelId={selectedModelId} />
         </div>

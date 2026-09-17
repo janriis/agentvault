@@ -320,6 +320,11 @@ Implementation record:
    ChatGPT subscription. Verification: 42 unit checks, TypeScript, production
    build, and a live UI rescan with five installed Ollama models. No model
    generation request was sent during testing.
+9. Added a persistent return link from agent chat to the main vault screen.
+   The link uses a full-page navigation because a client-side transition
+   exposed a runtime error in the current Next.js preview build. Verified the
+   destination renders in the live UI without a new error dialog. TypeScript,
+   42 unit checks, and the production build passed.
 
 ### Phase 6 — Verification and quality control
 
