@@ -2037,6 +2037,9 @@ function SettingsView({ loading, onSave, settings }: { readonly loading: boolean
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<string>();
   const [error, setError] = useState<string>();
+  const [checkingModel, setCheckingModel] = useState(false);
+  const [modelCheck, setModelCheck] = useState<{ models: DiscoveredModel[]; error?: string }>();
+  const modelCheckVersion = useRef(0);
 
   useEffect(() => setForm(settings), [settings]);
 
@@ -2044,6 +2047,34 @@ function SettingsView({ loading, onSave, settings }: { readonly loading: boolean
     setForm((current) => ({ ...current, [key]: value }));
     setStatus(undefined);
     setError(undefined);
+    if (key === "ollamaHost" || key === "defaultModel") {
+      modelCheckVersion.current += 1;
+      setCheckingModel(false);
+      setModelCheck(undefined);
+    }
+  };
+
+  const checkModel = async () => {
+    const version = ++modelCheckVersion.current;
+    setCheckingModel(true);
+    setModelCheck(undefined);
+    try {
+      const response = await fetch("/api/models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ host: form.ollamaHost }),
+      });
+      const payload = await response.json() as { models?: DiscoveredModel[]; errors?: string[]; error?: string };
+      if (version !== modelCheckVersion.current) return;
+      setModelCheck({
+        models: Array.isArray(payload.models) ? payload.models : [],
+        error: !response.ok ? payload.error ?? "Model check failed." : payload.errors?.[0],
+      });
+    } catch {
+      if (version === modelCheckVersion.current) setModelCheck({ models: [], error: "Could not check Ollama. Please try again." });
+    } finally {
+      if (version === modelCheckVersion.current) setCheckingModel(false);
+    }
   };
 
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
@@ -2076,6 +2107,12 @@ function SettingsView({ loading, onSave, settings }: { readonly loading: boolean
         <label className="space-y-2 text-sm font-medium" htmlFor="default-model">Default model provider<select className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" id="default-model" onChange={(event) => update("defaultModel", event.currentTarget.value as VaultSettings["defaultModel"])} value={form.defaultModel}><option value="chatgpt-subscription">ChatGPT subscription</option><option value="ollama">Ollama local</option></select></label>
         <label className="space-y-2 text-sm font-medium" htmlFor="ollama-host">Ollama address<Input id="ollama-host" onChange={(event) => update("ollamaHost", event.currentTarget.value)} value={form.ollamaHost} /></label>
         <p className="text-xs leading-5 text-muted-foreground">The Ollama address is used when local model discovery and execution are enabled.</p>
+        <Button disabled={checkingModel} onClick={checkModel} type="button" variant="outline"><RefreshCwIcon className={cn(checkingModel && "animate-spin")} />{checkingModel ? "Checking…" : "Check model"}</Button>
+        <p className="text-xs leading-5 text-muted-foreground">Checks this address and lists installed models without generating text. Save settings to use a new address in chat.</p>
+        {modelCheck ? <div aria-live="polite" className={cn("rounded-md border p-3 text-sm", modelCheck.error ? "border-destructive/40 text-destructive" : "border-emerald-600/40 text-emerald-800 dark:text-emerald-300")} role="status">
+          {modelCheck.error ? modelCheck.error : modelCheck.models.length === 0 ? "Ollama is connected, but no models are installed." : `Ollama is connected · ${modelCheck.models.length} local model${modelCheck.models.length === 1 ? "" : "s"} found.`}
+          {modelCheck.models.length > 0 ? <ul className="mt-2 list-inside list-disc text-foreground">{modelCheck.models.map((model) => <li key={model.id}>{model.name}{model.details ? ` · ${model.details}` : ""}</li>)}</ul> : null}
+        </div> : null}
       </SettingsCard>
       <SettingsCard title="Task execution" description="Set guardrails for assigned agent work. These values are saved centrally for every browser and worker.">
         <div className="grid gap-4 sm:grid-cols-2">

@@ -325,6 +325,12 @@ Implementation record:
    exposed a runtime error in the current Next.js preview build. Verified the
    destination renders in the live UI without a new error dialog. TypeScript,
    42 unit checks, and the production build passed.
+10. Added a read-only “Check model” action to Model defaults in Settings. It
+    checks the draft Ollama address without saving it or generating text, then
+    reports connection failures, empty installations, or installed model names.
+    The check accepts loopback addresses only. Verified 45 unit checks,
+    TypeScript, production build, and live success/invalid-address UI states;
+    no saved setting or model run was changed.
 
 ### Phase 6 — Verification and quality control
 
